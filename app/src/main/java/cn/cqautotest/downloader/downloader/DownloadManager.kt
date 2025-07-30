@@ -747,56 +747,96 @@ object DownloadManager {
         resumeDownload(taskId)
     }
 
-    private suspend fun updateTaskStatus(taskId: String, newStatus: DownloadStatus, isNetworkPaused: Boolean = false, error: Throwable? = null) {
-        checkInitialized()
+    /**
+     * 更新指定任务的状态，并可选地记录网络暂停状态和错误信息。
+     *
+     * 此函数会执行以下操作：
+     * 1. （可选）根据传入的 `error` 和当前任务状态确定最终要存储的错误消息 `errorMsg`。
+     * 2. 在数据库中更新任务的 `status`、`isPausedByNetwork` 和 `errorDetails`。
+     * 3. 从数据库重新获取更新后的任务信息。
+     * 4. 向 `_downloadProgressFlow` 发出一个新的 `DownloadProgress` 状态，以便UI和其他观察者可以响应。
+     * 5. 如果新的状态是终态（如 `FAILED` 或 `CANCELLED`），则从 `activeDownloads` 맵中移除与该任务关联的 Job（如果存在）。
+     * 6. 记录相应的日志信息。
+     *
+     * @param taskId 要更新状态的任务的 ID。
+     * @param newStatus 新的 `DownloadStatus`。
+     * @param isNetworkPaused 可选参数，指示任务是否因网络问题而暂停。默认为 `false`。
+     * @param error 可选参数，一个 `Throwable` 对象，表示导致状态更改的错误（例如，在状态为 `FAILED` 时）。默认为 `null`。
+     */
+    private suspend fun updateTaskStatus(
+        taskId: String,
+        newStatus: DownloadStatus,
+        isNetworkPaused: Boolean = false,
+        error: Throwable? = null
+    ) {
+        checkInitialized() // 确保 DownloadManager 已初始化
 
+        // 在更新前获取当前任务信息，主要用于确定 errorMsg 和在任务更新后找不到时回退使用旧数据
         val currentTaskBeforeUpdate = downloadDao.getTaskById(taskId)
-        val errorMsg = error?.message ?: if (newStatus == DownloadStatus.FAILED && currentTaskBeforeUpdate?.errorDetails == null) {
-            "Unknown error" // 如果变为 FAILED 且没有提供新错误，也没有旧错误，则给个默认值
-        } else {
-            currentTaskBeforeUpdate?.errorDetails // 保留已有的错误信息，除非被新的错误覆盖
-        }
 
-        // 更新数据库
+        // 确定要存储到数据库的错误消息 (errorMsg)
+        val errorMsg = error?.message // 优先使用新传入的错误信息
+            ?: if (newStatus == DownloadStatus.FAILED && currentTaskBeforeUpdate?.errorDetails == null) {
+                // 如果新状态是 FAILED，且没有提供新的 error 对象，并且数据库中也没有旧的 errorDetails，
+                // 则设置一个默认的 "Unknown error" 消息。
+                "Unknown error"
+            } else {
+                // 否则 (即有新 error、新状态不是 FAILED、或数据库中已有 errorDetails)，
+                // 保留数据库中已有的错误信息 (currentTaskBeforeUpdate?.errorDetails)。
+                // 如果 error?.message 存在，它会覆盖此处的逻辑。
+                currentTaskBeforeUpdate?.errorDetails
+            }
+
+        // 步骤 1: 更新数据库中的任务状态
         downloadDao.updateStatus(taskId, newStatus, isNetworkPaused, errorMsg)
 
-        // 为了发射最准确的进度，在更新数据库状态后，重新获取任务
+        // 步骤 2: 为了发射最准确的进度，在更新数据库状态后，重新获取任务的最新信息
         val updatedTask = downloadDao.getTaskById(taskId)
+
         if (updatedTask != null) {
+            // 如果成功获取到更新后的任务
             _downloadProgressFlow.tryEmit(
                 DownloadProgress(
                     updatedTask.id,
                     updatedTask.downloadedBytes,
                     updatedTask.totalBytes,
-                    newStatus, // 使用传入的 newStatus，因为 updatedTask.status 可能还未在事务中完全同步
-                    error ?: updatedTask.errorDetails?.let { IOException(it) } // 使用新错误，或DB中的错误
+                    newStatus, // 使用传入的 newStatus，因为 updatedTask.status 可能由于事务原因尚未在内存中立即完全同步，或者为了确保一致性
+                    error ?: updatedTask.errorDetails?.let { IOException(it) } // 优先使用传入的 error 对象；如果为 null，则尝试使用数据库中的 errorDetails (转换为 IOException)
                 )
             )
-            Timber.d("Task ${updatedTask.id} status updated to $newStatus. IsNetworkPaused: $isNetworkPaused. Emitted progress: ${updatedTask.downloadedBytes}/${updatedTask.totalBytes}. Error: ${errorMsg ?: "null"}")
+            Timber.d(
+                "任务 ${updatedTask.id} 状态更新为 $newStatus。 IsNetworkPaused: $isNetworkPaused。 发射进度: ${updatedTask.downloadedBytes}/${updatedTask.totalBytes}。 错误: ${errorMsg ?: "无"}" // 使用上面确定的 errorMsg 进行日志记录
+            )
 
-            // 如果任务进入终态 (FAILED, CANCELLED)，从 activeDownloads 中移除 Job (如果存在)
+            // 如果任务进入了终态 (例如 FAILED, CANCELLED)，
+            // 则从 activeDownloads 映射中移除其对应的协程 Job (如果存在)。
+            // 这是因为这些状态意味着任务的执行生命周期已经结束。
             if (newStatus == DownloadStatus.FAILED || newStatus == DownloadStatus.CANCELLED) {
                 activeDownloads.remove(updatedTask.id)?.let {
-                    Timber.d("Job for task ${updatedTask.id} (now $newStatus) was removed from activeDownloads map in updateTaskStatus as it's a final state.")
+                    // Job 存在且已被移除
+                    Timber.d("任务 ${updatedTask.id} (当前新状态为 $newStatus) 的 Job 已在 updateTaskStatus 中从 activeDownloads 映射中移除，因为这是一个最终状态。")
                 }
             }
         } else {
-            Timber.w("Task $taskId not found after status update to $newStatus, cannot emit definitive progress. Emitting based on provided status and old data if available.")
-            // 即使任务找不到了，如果 newStatus 是一个终态，也尝试为 taskId 发射一个简单的状态
-            // 这有助于UI更新，即使数据不完整
+            // 在数据库更新状态后未能找到该任务，这通常不应该发生，但需要处理。
+            Timber.w(
+                "任务 $taskId 在状态更新为 $newStatus 后未在数据库中找到，无法发射确切的进度。" +
+                        " 将尝试基于提供的新状态和更新前的旧数据 (如果可用) 发射一个状态。"
+            )
+            // 即使任务在更新后找不到了 (例如，在极端的并发情况下被删除)，
+            // 如果 newStatus 是一个重要的终态，仍然尝试为 taskId 发射一个简单的状态通知。
+            // 这有助于UI层至少能够根据 taskId 和新状态进行更新，即使数据不完整。
             _downloadProgressFlow.tryEmit(
                 DownloadProgress(
-                    taskId,
-                    currentTaskBeforeUpdate?.downloadedBytes ?: 0L, // 尝试使用旧值
-                    currentTaskBeforeUpdate?.totalBytes ?: 0L,   // 尝试使用旧值
-                    newStatus,
-                    error ?: currentTaskBeforeUpdate?.errorDetails?.let { IOException(it) }
+                    taskId, // 仍然使用原始 taskId
+                    currentTaskBeforeUpdate?.downloadedBytes ?: 0L, // 尝试使用更新前获取的旧下载字节数，如果不存在则为 0
+                    currentTaskBeforeUpdate?.totalBytes ?: 0L,   // 尝试使用更新前获取的旧总字节数，如果不存在则为 0
+                    newStatus,                                      // 使用传入的新状态
+                    error ?: currentTaskBeforeUpdate?.errorDetails?.let { IOException(it) } // 优先使用传入的 error，其次是旧的 errorDetails
                 )
             )
         }
     }
-
-    // ... (DownloadManager 的其他部分代码保持不变) ...
 
     private suspend fun executeDownload(initialTaskStateFromQueue: DownloadTask) {
         checkInitialized()
