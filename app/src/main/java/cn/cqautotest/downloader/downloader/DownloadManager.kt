@@ -248,42 +248,65 @@ object DownloadManager {
     private fun resumeInterruptedTasksOnStart() {
         checkInitialized()
         downloadScope.launch {
-            Timber.d("Resuming interrupted tasks on application start...")
+            Timber.d("应用启动时恢复被中断的任务...")
             // 获取在应用关闭时可能处于 DOWNLOADING 或 PENDING 状态的任务
             val tasksToProcess = downloadDao.getTasksByStatuses(listOf(DownloadStatus.DOWNLOADING, DownloadStatus.PENDING))
 
-            tasksToProcess.forEach loop@{ task ->
-                val currentTaskState = downloadDao.getTaskById(task.id) ?: return@loop
+            tasksToProcess.forEach loop@{ initialTask ->
+                var currentTaskState = downloadDao.getTaskById(initialTask.id) ?: return@loop
 
                 // 如果任务上次是 DOWNLOADING 状态，说明被中断了，先标记为 PAUSED
+                // 这样做可以统一后续处理逻辑，因为所有中断的任务都会先进入 PAUSED 状态
                 if (currentTaskState.status == DownloadStatus.DOWNLOADING) {
-                    Timber.i("Task ${currentTaskState.id} was DOWNLOADING, setting to PAUSED (Interrupted on start).")
-                    updateTaskStatus(currentTaskState.id, DownloadStatus.PAUSED, currentTaskState.isPausedByNetwork, IOException("Download interrupted by application restart"))
+                    Timber.i("任务 ${currentTaskState.id} 状态为 DOWNLOADING，设置为 PAUSED (启动时被中断)。")
+                    updateTaskStatus(
+                        currentTaskState.id,
+                        DownloadStatus.PAUSED,
+                        currentTaskState.isPausedByNetwork, // 保留原始的网络暂停状态
+                        IOException("下载因应用重启被中断")
+                    )
+                    // 重新获取任务状态，因为上面已经更新了
+                    currentTaskState = downloadDao.getTaskById(initialTask.id) ?: return@loop
                 }
 
-                // 重新获取任务状态，因为上面可能已经更新了
-                val updatedTaskState = downloadDao.getTaskById(task.id) ?: return@loop
-
-                // 场景1: 如果任务是网络暂停的，并且现在网络已连接，则尝试恢复
-                if (updatedTaskState.status == DownloadStatus.PAUSED && updatedTaskState.isPausedByNetwork && isNetworkConnected) {
-                    Timber.i("Task ${updatedTaskState.id} was network-paused, network is back. Attempting to resume.")
-                    resumeDownload(updatedTaskState.id)
+                // 使用 when 表达式处理不同状态的任务
+                when (currentTaskState.status) {
+                    DownloadStatus.PAUSED -> {
+                        // 场景1: 如果任务是网络暂停的，并且现在网络已连接，则尝试恢复
+                        if (currentTaskState.isPausedByNetwork && isNetworkConnected) {
+                            Timber.i("任务 ${currentTaskState.id} 因网络暂停，网络已恢复。尝试恢复。")
+                            resumeDownload(currentTaskState.id)
+                        }
+                        // 场景4: 如果任务是用户手动暂停的 (PAUSED 但非 isPausedByNetwork)，并且网络连接，则保持不变
+                        else if (!currentTaskState.isPausedByNetwork && isNetworkConnected) {
+                            Timber.d("任务 ${currentTaskState.id} 状态为 PAUSED (非网络原因) 且网络已连接。将等待手动恢复。")
+                            // 此处无需操作，等待用户手动恢复
+                        }
+                        // 其他 PAUSED 情况 (例如网络未连接时，因网络暂停的任务) 则不作处理，保持 PAUSED
+                    }
+                    DownloadStatus.PENDING -> {
+                        // 场景2: 如果任务是 PENDING 状态，并且网络已连接，则加入下载队列
+                        if (isNetworkConnected) {
+                            Timber.d("任务 ${currentTaskState.id} 状态为 PENDING 且网络已连接。添加到队列。")
+                            taskQueueChannel.send(currentTaskState.id)
+                        }
+                        // 场景3: 如果任务是 PENDING 状态，但网络未连接，则标记为网络暂停
+                        else { // !isNetworkConnected
+                            Timber.w("任务 ${currentTaskState.id} 状态为 PENDING，但网络已断开。标记为网络暂停。")
+                            updateTaskStatus(
+                                currentTaskState.id,
+                                DownloadStatus.PAUSED,
+                                isNetworkPaused = true,
+                                error = IOException("待处理任务启动时网络不可用")
+                            )
+                        }
+                    }
+                    // 其他状态 (例如，COMPLETED, FAILED, CANCELLED) 在初始获取时已被过滤，
+                    // 或者在 DOWNLOADING -> PAUSED 转换后不符合这里的条件，因此默认不处理。
+                    else -> {
+                        Timber.d("任务 ${currentTaskState.id} 状态为 ${currentTaskState.status}，在启动恢复逻辑中不执行任何操作。")
+                    }
                 }
-                // 场景2: 如果任务是 PENDING 状态，并且网络已连接，则加入下载队列
-                else if (updatedTaskState.status == DownloadStatus.PENDING && isNetworkConnected) {
-                    Timber.d("Task ${updatedTaskState.id} is PENDING and network connected. Adding to queue.")
-                    taskQueueChannel.send(updatedTaskState.id)
-                }
-                // 场景3: 如果任务是 PENDING 状态，但网络未连接，则标记为网络暂停
-                else if (updatedTaskState.status == DownloadStatus.PENDING && !isNetworkConnected) {
-                    Timber.w("Task ${updatedTaskState.id} is PENDING, but network is disconnected. Marking as network-paused.")
-                    updateTaskStatus(updatedTaskState.id, DownloadStatus.PAUSED, isNetworkPaused = true, error = IOException("Network unavailable at start for pending task"))
-                }
-                // 场景4: 如果任务是用户手动暂停的 (PAUSED 但非 isPausedByNetwork)，并且网络连接，则保持不变，等待用户手动恢复
-                else if (updatedTaskState.status == DownloadStatus.PAUSED && !updatedTaskState.isPausedByNetwork && isNetworkConnected) {
-                    Timber.d("Task ${updatedTaskState.id} is PAUSED (not by network) and network connected. It will wait for manual resume.")
-                }
-                // 其他情况（例如，任务已经是 FAILED, CANCELLED, COMPLETED，或者网络断开时的 PAUSED）则不作处理
             }
         }
     }
