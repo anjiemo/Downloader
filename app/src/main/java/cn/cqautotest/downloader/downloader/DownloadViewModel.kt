@@ -15,22 +15,12 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 class DownloadViewModel(private val application: Application) : ViewModel() {
+
     private val _uiState = MutableStateFlow(DownloadUiState())
     val uiState: StateFlow<DownloadUiState> = _uiState.asStateFlow()
-
     private var apkUrlToDownload: String? = null
 
     init {
-        // **重要提示:** 确保 DownloadManager 已经在 Application 的 onCreate 中初始化。
-        // 例如:
-        // class YourApplication : Application() {
-        //     override fun onCreate() {
-        //         super.onCreate()
-        //         Timber.plant(Timber.DebugTree()) // 推荐用于日志
-        //         DownloadManager.initialize(this) // 初始化 DownloadManager
-        //     }
-        // }
-
         viewModelScope.launch {
             DownloadManager.downloadProgressFlow.collect { progress ->
                 if (progress.taskId == _uiState.value.currentTaskId || _uiState.value.currentTaskId == null) {
