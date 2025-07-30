@@ -1079,200 +1079,169 @@ object DownloadManager {
         var currentTask: DownloadTask // 定义明确的任务对象，将在整个函数中引用最新的任务状态
 
         // --- 步骤 1: 从数据库重新获取任务，以确保我们拥有最新的状态 ---
-        // initialTaskStateFromQueue 可能是在任务被添加到队列时的状态，可能已经过时
-        val taskFromDb = downloadDao.getTaskById(initialTaskStateFromQueue.id)
-        if (taskFromDb == null) {
+        val taskFromDbOnEntry = downloadDao.getTaskById(initialTaskStateFromQueue.id)
+        if (taskFromDbOnEntry == null) {
             Timber.e("任务 ${initialTaskStateFromQueue.id} 在 executeDownload 开始时未在数据库中找到。")
+            _downloadProgressFlow.tryEmit(
+                DownloadProgress(
+                    initialTaskStateFromQueue.id, 0L, 0L, DownloadStatus.FAILED,
+                    IOException("任务记录在启动时丢失")
+                )
+            )
+            activeDownloads.remove(initialTaskStateFromQueue.id) // 清理 activeDownloads
             return // 任务不存在，无法继续
         }
-        currentTask = taskFromDb // 使用从数据库获取的最新任务状态
-        Timber.i("executeDownload 开始处理任务 ${currentTask.id} (${currentTask.fileName})。URL: ${currentTask.url}。初始数据库状态: ${currentTask.status}")
+        currentTask = taskFromDbOnEntry
+        Timber.i("executeDownload 开始处理任务 ${currentTask.id} (${currentTask.fileName})。URL: ${currentTask.url}。初始数据库状态: ${currentTask.status}，已下载: ${currentTask.downloadedBytes}")
 
         // --- 步骤 2: 验证任务是否处于可开始的状态 ---
-        // 只有 PENDING 状态且未被网络暂停的任务才应该开始下载
         if (currentTask.status != DownloadStatus.PENDING || currentTask.isPausedByNetwork) {
             Timber.w("任务 ${currentTask.id} 无法启动 (数据库状态: ${currentTask.status}, isPausedByNetwork: ${currentTask.isPausedByNetwork})。正在中止。")
-            // 如果任务已经是 FAILED 或 PAUSED 状态，可以向UI发出此状态，以便UI同步
-            if (currentTask.status == DownloadStatus.FAILED || currentTask.status == DownloadStatus.PAUSED) {
+            if (currentTask.status == DownloadStatus.FAILED || currentTask.status == DownloadStatus.PAUSED || currentTask.status == DownloadStatus.CANCELLED) {
                 _downloadProgressFlow.tryEmit(
                     DownloadProgress(
-                        currentTask.id,
-                        currentTask.downloadedBytes,
-                        currentTask.totalBytes,
-                        currentTask.status,
-                        currentTask.errorDetails?.let { IOException(it) }
+                        currentTask.id, currentTask.downloadedBytes, currentTask.totalBytes,
+                        currentTask.status, currentTask.errorDetails?.let { IOException(it) }
                     )
                 )
+            } else if (currentTask.status != DownloadStatus.COMPLETED) {
+                updateTaskStatus(currentTask.id, DownloadStatus.FAILED, currentTask.isPausedByNetwork, IOException("任务启动时状态无效: ${currentTask.status}"))
             }
-            return // 任务状态不适合开始下载
+            activeDownloads.remove(currentTask.id) // 清理 activeDownloads
+            return
         }
 
         // --- 步骤 3: 将任务状态更新为 DOWNLOADING ---
-        // 这表示下载过程正式开始
-        updateTaskStatus(currentTask.id, DownloadStatus.DOWNLOADING, isNetworkPaused = false)
+        // 注意：这里传入的 isNetworkPaused 应该是 false，因为我们要开始下载了
+        updateTaskStatus(currentTask.id, DownloadStatus.DOWNLOADING, isNetworkPaused = false, error = null)
 
-        // --- 步骤 4: 在设置为 DOWNLOADING 后重新获取任务状态 ---
-        // 这是为了确保状态已成功更新，并且没有其他并发操作 (如立即取消) 改变了它
-        val taskAfterUpdateToDownloading = downloadDao.getTaskById(currentTask.id)
+        // --- 步骤 4: 在设置为 DOWNLOADING 后重新获取任务状态，并记录进入下载时的初始字节数 ---
+        var taskAfterUpdateToDownloading = downloadDao.getTaskById(currentTask.id)
         if (taskAfterUpdateToDownloading == null) {
             Timber.e("任务 ${currentTask.id} 在状态更新为 DOWNLOADING 后从数据库消失。")
-            // 这是一个严重错误，因为我们无法继续处理一个不存在的任务记录
             updateTaskStatus(initialTaskStateFromQueue.id, DownloadStatus.FAILED, error = IOException("任务在状态更新为 DOWNLOADING 后消失"))
             return
         }
-        // 检查状态是否确实是 DOWNLOADING
         if (taskAfterUpdateToDownloading.status != DownloadStatus.DOWNLOADING) {
             Timber.w("任务 ${currentTask.id} 在数据库更新后状态为 ${taskAfterUpdateToDownloading.status} (不是 DOWNLOADING)。错误: ${taskAfterUpdateToDownloading.errorDetails}。正在中止 executeDownload。")
-            // 状态可能已被并发操作 (例如用户取消) 更改。
-            // 发出从数据库获取的当前状态。
-            _downloadProgressFlow.tryEmit(
-                DownloadProgress(
-                    taskAfterUpdateToDownloading.id,
-                    taskAfterUpdateToDownloading.downloadedBytes,
-                    taskAfterUpdateToDownloading.totalBytes,
-                    taskAfterUpdateToDownloading.status,
-                    taskAfterUpdateToDownloading.errorDetails?.let { IOException(it) }
-                )
-            )
-            return // 任务状态已改变，不应继续下载
+            return
         }
-        currentTask = taskAfterUpdateToDownloading // 更新 currentTask 为最新的 DOWNLOADING 状态
-        Timber.d("任务 ${currentTask.id} 已确认状态为 DOWNLOADING。文件: ${currentTask.fileName}。当前已下载: ${currentTask.downloadedBytes}")
-
-        // --- 设置 HTTP 请求 ---
+        currentTask = taskAfterUpdateToDownloading
+        val initialDownloadedBytesForSession = currentTask.downloadedBytes
+        var bytesActuallyWrittenThisSession: Long = 0 // 本次下载会话实际写入文件的字节数
+        Timber.d("任务 ${currentTask.id} 已确认状态为 DOWNLOADING。文件: ${currentTask.fileName}。会话开始时已下载: $initialDownloadedBytesForSession")
         val requestBuilder = Request.Builder().url(currentTask.url)
-        var expectedBytesToReceiveThisSession: Long = -1 // 用于跟踪本次 HTTP 响应期望接收的字节数 (-1 表示未知或整个文件)
+        var expectedContentLengthFromServer: Long = -1 // 用于跟踪本次 HTTP 响应头中的 Content-Length
 
-        // 如果已有下载进度，则设置 Range 和 If-Range 请求头以支持断点续传
-        if (currentTask.downloadedBytes > 0) {
-            requestBuilder.addHeader("Range", "bytes=${currentTask.downloadedBytes}-")
-            // If-Range 用于确保服务器上的文件自上次下载以来没有改变
+        if (initialDownloadedBytesForSession > 0) {
+            requestBuilder.addHeader("Range", "bytes=${initialDownloadedBytesForSession}-")
             currentTask.eTag?.let { requestBuilder.addHeader("If-Range", it) }
                 ?: currentTask.lastModified?.let { requestBuilder.addHeader("If-Range", it) }
-            Timber.d("任务 ${currentTask.id}: 从 ${currentTask.downloadedBytes} 字节处恢复下载。")
+            Timber.d("任务 ${currentTask.id}: 从 $initialDownloadedBytesForSession 字节处恢复下载。")
         }
 
         var response: Response? = null
         var randomAccessFile: RandomAccessFile? = null
-        var bytesActuallyWrittenThisSession: Long = 0 // 本次下载会话实际写入文件的字节数
 
         try {
-            // --- 检查协程是否在网络请求前已被取消 ---
             if (!currentCoroutineContext().isActive) {
-                throw CancellationException("下载任务 ${currentTask.id} 在网络请求前已被取消。")
+                throw CancellationException("下载任务 ${currentTask.id} 在网络请求前已被取消 (coroutine not active)。")
             }
 
-            // --- 执行网络请求 ---
             val request = requestBuilder.build()
             Timber.d("任务 ${currentTask.id}: 正在执行 HTTP 请求到 ${request.url}")
-            response = okHttpClient.newCall(request).execute() // 同步执行 OkHttp 请求 (因在 Dispatchers.IO 协程中)
+            response = okHttpClient.newCall(request).execute()
             Timber.d("任务 ${currentTask.id}: 收到响应，状态码: ${response.code}")
 
-            // --- 在写入文件前再次检查任务状态和协程状态 ---
-            // 网络操作可能耗时，在此期间任务可能已被外部取消或暂停
-            val taskStateBeforeWrite = downloadDao.getTaskById(currentTask.id) // 获取最新的数据库状态
+            // 在处理响应前，再次检查任务状态和协程状态
+            var taskStateBeforeWrite = downloadDao.getTaskById(currentTask.id)
             if (!currentCoroutineContext().isActive || taskStateBeforeWrite == null || taskStateBeforeWrite.status != DownloadStatus.DOWNLOADING) {
-                Timber.w("任务 ${currentTask.id} 在网络操作期间/之后被取消或状态已更改 (数据库状态: ${taskStateBeforeWrite?.status})。正在中止写入操作。")
-                response.close() // 关闭响应体
+                Timber.w("任务 ${currentTask.id} 在网络响应后被取消或状态已更改 (DB状态: ${taskStateBeforeWrite?.status} / Coroutine: ${currentCoroutineContext().isActive})。中止写入。")
+                response.close()
                 if (taskStateBeforeWrite == null) {
-                    // 如果任务记录消失了，这是一个错误
-                    updateTaskStatus(currentTask.id, DownloadStatus.FAILED, error = IOException("任务在网络操作期间消失"))
-                } else if (taskStateBeforeWrite.status != DownloadStatus.CANCELLED && taskStateBeforeWrite.status != DownloadStatus.PAUSED) {
-                    // 如果状态不是预期的 DOWNLOADING，也不是用户主动的 CANCELLED 或 PAUSED，
-                    // 这可能是一个意外的状态变化。
-                    // 之前的逻辑是将其更新为 FAILED，但当前逻辑是尊重数据库中已有的最终状态 (如 CANCELLED/PAUSED)，这是合理的。
-                    Timber.i("任务 ${currentTask.id} 状态已经是 ${taskStateBeforeWrite.status}，将保持此状态。")
+                    updateTaskStatus(currentTask.id, DownloadStatus.FAILED, error = IOException("任务在网络响应后消失"))
                 }
                 return // 不再继续写入
             }
-            currentTask = taskStateBeforeWrite // 在继续之前，用数据库中的最新状态刷新 currentTask
-
+            currentTask = taskStateBeforeWrite // 刷新 currentTask
             // --- 处理 HTTP 响应状态码 ---
-            if (!response.isSuccessful) {
-                // 特殊处理 HTTP 416 Range Not Satisfiable (通常在请求的范围无效时发生)
-                if (response.code == 416 && currentTask.downloadedBytes > 0) {
-                    Timber.w("任务 ${currentTask.id}: HTTP 416 Range Not Satisfiable。已下载: ${currentTask.downloadedBytes}。")
-                    val contentRange = response.header("Content-Range") // 例如 "bytes */12345"
-                    val serverTotalSize = contentRange?.substringAfterLast('/')?.toLongOrNull()
+            if (response.code == 416) { // Range Not Satisfiable
+                Timber.w("任务 ${currentTask.id}: HTTP 416 Range Not Satisfiable。当前已下载 (DB): ${currentTask.downloadedBytes}。")
+                val contentRange = response.header("Content-Range") // e.g., "bytes */12345"
+                val serverTotalSize = contentRange?.substringAfterLast('/')?.toLongOrNull()
+                response.close()
 
-                    if (serverTotalSize != null && currentTask.downloadedBytes >= serverTotalSize) {
-                        // 如果已下载字节数等于或超过服务器报告的总大小，说明文件可能已下载完成
-                        Timber.i("任务 ${currentTask.id}: HTTP 416 确认下载已完成。服务器总大小: $serverTotalSize。标记为 COMPLETED。")
-                        if (currentTask.totalBytes != serverTotalSize || currentTask.downloadedBytes != serverTotalSize) {
-                            // 确保数据库中的总字节数和已下载字节数与服务器一致
-                            downloadDao.updateProgress(currentTask.id, serverTotalSize, serverTotalSize)
-                        }
-                        updateTaskStatus(currentTask.id, DownloadStatus.COMPLETED, isNetworkPaused = false)
-                    } else {
-                        // 已下载字节数与服务器报告的总大小不一致，文件可能已更改或范围请求确实无效
-                        Timber.w("任务 ${currentTask.id}: HTTP 416，但已下载 (${currentTask.downloadedBytes}) 与服务器总大小 ($serverTotalSize) 不一致。文件可能已更改或范围无效。正在重置任务。")
-                        val error = IOException("Range not satisfiable (416)。文件可能已更改或范围无效。服务器总大小: $serverTotalSize。请从头开始重试。")
-                        downloadDao.updateProgress(currentTask.id, 0L, 0L) // 重置进度
-                        downloadDao.updateETagAndLastModified(currentTask.id, null, null) // 清除 ETag 和 LastModified，以便下次重新获取
-                        updateTaskStatus(currentTask.id, DownloadStatus.FAILED, isNetworkPaused = false, error = error)
+                if (serverTotalSize != null && currentTask.downloadedBytes >= serverTotalSize) {
+                    Timber.i("任务 ${currentTask.id}: HTTP 416 确认下载已完成。服务器总大小: $serverTotalSize。标记为 COMPLETED。")
+                    if (currentTask.totalBytes != serverTotalSize || currentTask.downloadedBytes != serverTotalSize) {
+                        downloadDao.updateProgress(currentTask.id, serverTotalSize, serverTotalSize)
+                        currentTask = currentTask.copy(downloadedBytes = serverTotalSize, totalBytes = serverTotalSize)
                     }
-                    response.close()
-                    return
+                    updateTaskStatus(currentTask.id, DownloadStatus.COMPLETED)
+                } else {
+                    Timber.w("任务 ${currentTask.id}: HTTP 416，但已下载 (${currentTask.downloadedBytes}) 与服务器总大小 ($serverTotalSize) 不符或总大小未知。文件可能已更改。正在重置任务。")
+                    val error = IOException("Range not satisfiable (416). File may have changed. Server total: $serverTotalSize. Current downloaded: ${currentTask.downloadedBytes}. Resetting.")
+                    downloadDao.updateProgress(currentTask.id, 0L, 0L)
+                    downloadDao.updateETagAndLastModified(currentTask.id, null, null)
+                    updateTaskStatus(currentTask.id, DownloadStatus.FAILED, isNetworkPaused = false, error = error)
                 }
-                // 处理其他不成功的 HTTP 响应
-                val errorBody = response.body?.string() ?: "无错误响应体"
-                Timber.e("任务 ${currentTask.id}: HTTP 响应不成功 ${response.code} ${response.message}。响应体: $errorBody")
-                response.close() // 在抛出异常前关闭响应
-                throw IOException("服务器响应异常 ${response.code} ${response.message} (任务 ${currentTask.id})。响应体: $errorBody")
+                return
             }
 
+            if (!response.isSuccessful) {
+                val errorBody = response.body?.string() ?: "N/A"
+                response.close()
+                Timber.e("任务 ${currentTask.id}: HTTP 响应不成功 ${response.code} ${response.message}. Body: $errorBody")
+                throw IOException("Server error ${response.code} ${response.message}. Task ${currentTask.id}. Body: $errorBody")
+            }
             // --- 处理成功的 HTTP 响应 ---
             val responseBody = response.body ?: throw IOException("任务 ${currentTask.id} 的响应体为 null")
-            val newETag = response.header("ETag") // 获取新的 ETag
-            val newLastModified = response.header("Last-Modified") // 获取新的 Last-Modified
+            expectedContentLengthFromServer = responseBody.contentLength()
 
-            var serverReportedTotalBytes = currentTask.totalBytes // 初始化为当前任务已知的总字节数
-            var dbDownloadedBytesSnapshot = currentTask.downloadedBytes // 本次会话开始前，数据库中记录的已下载字节数快照
+            var serverReportedTotalBytesInHeader = currentTask.totalBytes
+            val newETag = response.header("ETag")
+            val newLastModified = response.header("Last-Modified")
 
-            if (response.code == 206) { // HTTP 206 Partial Content (断点续传成功)
-                Timber.d("任务 ${currentTask.id}: 成功恢复下载 (HTTP 206)。")
-                val contentRange = response.header("Content-Range") // 例如 "bytes 100-200/12345"
+            if (response.code == 200) { // HTTP 200 OK (完整内容)
+                Timber.i("任务 ${currentTask.id}: 收到 HTTP 200 OK。将从头开始下载。")
+                if (initialDownloadedBytesForSession > 0) {
+                    Timber.w("任务 ${currentTask.id}: 收到 HTTP 200，但之前有进度 ($initialDownloadedBytesForSession bytes)。重置数据库进度为 0。")
+                    downloadDao.updateDownloadedBytes(currentTask.id, 0L)
+                    currentTask = currentTask.copy(downloadedBytes = 0L)
+                }
+                serverReportedTotalBytesInHeader = expectedContentLengthFromServer
+            } else if (response.code == 206) { // HTTP 206 Partial Content
+                Timber.d("任务 ${currentTask.id}: 成功恢复下载 (HTTP 206)。从 ${currentTask.downloadedBytes} 开始。")
+                val contentRange = response.header("Content-Range")
                 val serverTotalFromRange = contentRange?.substringAfterLast('/')?.toLongOrNull()
                 if (serverTotalFromRange != null && serverTotalFromRange > 0) {
-                    serverReportedTotalBytes = serverTotalFromRange // 从 Content-Range 更新服务器报告的总字节数
+                    serverReportedTotalBytesInHeader = serverTotalFromRange
                 }
-                expectedBytesToReceiveThisSession = responseBody.contentLength() // 本次期望接收的只是部分内容的长度
-            } else { // HTTP 200 OK (或其他成功码，表示完整内容)
-                Timber.d("任务 ${currentTask.id}: 开始新的下载 (HTTP ${response.code})。为本次会话重置本地已下载计数。")
-                dbDownloadedBytesSnapshot = 0L // 对于完整下载，之前的进度与本次会话的起始点无关
-                if (currentTask.downloadedBytes > 0) {
-                    // 如果数据库中存在进度，但服务器返回了 HTTP 200 (而不是 206)，
-                    // 这意味着服务器可能不支持 Range 请求，或者 If-Range 条件未满足 (文件已更改)。
-                    // 此时应从头开始下载。
-                    Timber.w("任务 ${currentTask.id}: 服务器返回 HTTP 200，尽管存在本地进度。正在将数据库中的已下载字节重置为 0。")
-                    downloadDao.updateDownloadedBytes(currentTask.id, 0L) // 关键：重置数据库中的下载进度
-                    currentTask = currentTask.copy(downloadedBytes = 0L) // 更新内存中的任务对象
+            } else {
+                Timber.w("任务 ${currentTask.id}: 收到未知成功码 ${response.code}。按 HTTP 200 处理。")
+                if (initialDownloadedBytesForSession > 0) {
+                    downloadDao.updateDownloadedBytes(currentTask.id, 0L)
+                    currentTask = currentTask.copy(downloadedBytes = 0L)
                 }
-                serverReportedTotalBytes = responseBody.contentLength() // 服务器报告的总字节数 (可能是 -1 如果未知)
-                expectedBytesToReceiveThisSession = serverReportedTotalBytes // 期望接收整个文件
+                serverReportedTotalBytesInHeader = expectedContentLengthFromServer
             }
 
-            // --- 更新任务元数据 (ETag, LastModified, TotalBytes) 如果发生变化 ---
             var taskMetaChanged = false
             if (newETag != currentTask.eTag || newLastModified != currentTask.lastModified) {
                 downloadDao.updateETagAndLastModified(currentTask.id, newETag, newLastModified)
                 taskMetaChanged = true
             }
-            if (serverReportedTotalBytes > 0 && serverReportedTotalBytes != currentTask.totalBytes) {
-                downloadDao.updateTotalBytes(currentTask.id, serverReportedTotalBytes)
+            if (serverReportedTotalBytesInHeader > 0 && serverReportedTotalBytesInHeader != currentTask.totalBytes) {
+                downloadDao.updateTotalBytes(currentTask.id, serverReportedTotalBytesInHeader)
                 taskMetaChanged = true
             }
 
-            // 如果元数据发生变化 (ETag, LastModified 或 TotalBytes)，重新从数据库获取任务，以确保 currentTask 是最新的
             if (taskMetaChanged) {
                 val refreshedTask = downloadDao.getTaskById(currentTask.id)
                 if (refreshedTask != null) {
                     currentTask = refreshedTask
-                    // 确保 dbDownloadedBytesSnapshot 与 (可能已重置的) currentTask.downloadedBytes 一致
-                    dbDownloadedBytesSnapshot = currentTask.downloadedBytes
-                    Timber.d("任务 ${currentTask.id} 元数据已更新。新 ETag: ${currentTask.eTag}, 新 LastModified: ${currentTask.lastModified}, 新 TotalBytes: ${currentTask.totalBytes}")
+                    Timber.d("任务 ${currentTask.id} 元数据已更新。ETag: ${currentTask.eTag}, LastModified: ${currentTask.lastModified}, TotalBytes: ${currentTask.totalBytes}, CurrentDownloaded: ${currentTask.downloadedBytes}")
                 } else {
-                    Timber.e("任务 ${currentTask.id} 在元数据更新后从数据库消失。正在中止。")
                     response.close()
                     throw IOException("任务 ${currentTask.id} 在元数据更新后消失")
                 }
@@ -1283,203 +1252,168 @@ object DownloadManager {
             val parentDir = file.parentFile
             if (parentDir != null && !parentDir.exists()) {
                 if (!parentDir.mkdirs()) {
-                    response.close() // 关闭网络响应
+                    response.close()
                     throw IOException("为任务 ${currentTask.id} 创建目录失败: ${parentDir.absolutePath}")
                 }
             }
 
-            randomAccessFile = RandomAccessFile(file, "rw") // 以读写模式打开文件
-            randomAccessFile.seek(currentTask.downloadedBytes) // 定位到应开始写入新数据的位置
+            randomAccessFile = RandomAccessFile(file, "rw")
+            // currentTask.downloadedBytes 此时是准确的写入起始点 (0 或之前的进度)
+            randomAccessFile.seek(currentTask.downloadedBytes)
+            Timber.d("任务 ${currentTask.id}: RandomAccessFile seek to ${currentTask.downloadedBytes}")
 
             // --- 读取响应体并写入文件 ---
-            val buffer = ByteArray(64 * 1024) // 64KB 缓冲区，大小可以调整
-            var bytesRead: Int // 单次从输入流读取的字节数
-            var lastUiEmitTime = System.currentTimeMillis() // 上次发送UI进度更新的时间戳
-            var bytesSinceLastDbUpdate: Long = 0 // 自上次更新数据库进度以来下载的字节数
-            val dbUpdateThresholdBytes: Long = 1 * 1024 * 1024 // 数据库进度更新阈值 (例如 1MB)，可调整
+            val buffer = ByteArray(64 * 1024) // 64KB buffer
+            var bytesReadFromStream: Int
+            var lastUiEmitTime = System.currentTimeMillis()
+            var bytesSinceLastDbUpdate: Long = 0
+            val dbUpdateThresholdBytes: Long = 512 * 1024 // 每 512KB 更新一次数据库
 
-            responseBody.byteStream().use { inputStream -> // 使用 .use 确保输入流在完成后自动关闭
-                while (true) { // 无限循环，直到 break 或异常
-                    // 检查1: 协程是否被取消 (例如用户操作或父协程取消)
+            responseBody.byteStream().use { inputStream ->
+                while (true) {
                     if (!currentCoroutineContext().isActive) {
-                        Timber.i("任务 ${currentTask.id} 在读取循环中检测到协程非活动，判定为取消。")
-                        throw CancellationException("下载 ${currentTask.id} 已取消 (协程作用域)。")
+                        Timber.i("任务 ${currentTask.id} 在读取循环中检测到协程非活动。")
+                        break // 由 finally 处理进度保存和状态
                     }
 
-                    // 检查2: 定期从数据库检查任务状态，以响应外部暂停/取消
-                    // 这个检查可以比UI更新频率低一些
-                    if (System.currentTimeMillis() - lastUiEmitTime > 2000) { // 例如，每2秒检查一次数据库状态
+                    // 检查数据库状态以响应外部暂停/取消
+                    if (System.currentTimeMillis() - lastUiEmitTime > 500) { // 可调整检查频率
                         val taskStateInLoop = downloadDao.getTaskById(currentTask.id)
                         if (taskStateInLoop == null || taskStateInLoop.status != DownloadStatus.DOWNLOADING) {
-                            Timber.w("任务 ${currentTask.id} 在下载过程中数据库状态变为 ${taskStateInLoop?.status}。正在中止写入循环。")
-                            // 如果任务为 null，说明发生了严重错误。
-                            // 如果状态改变，说明应用的其他部分 (例如用户暂停/取消) 修改了它。
-                            // 循环应终止以尊重该状态。
-                            break // 退出 while 循环，后续逻辑将处理最终状态
+                            Timber.w("任务 ${currentTask.id} 在下载过程中数据库状态变为 ${taskStateInLoop?.status}。中止写入循环。")
+                            break
                         }
+                        // 可选：如果 totalBytes 更新，则刷新 currentTask.totalBytes
+                        // currentTask = taskStateInLoop
                     }
 
-                    // 从输入流读取数据到缓冲区
-                    bytesRead = inputStream.read(buffer)
-                    if (bytesRead == -1) {
-                        break // 到达流末尾 (EOF)，下载完成
-                    }
-                    if (bytesRead == 0) continue // 理论上不应发生，但以防万一
+                    bytesReadFromStream = inputStream.read(buffer)
+                    if (bytesReadFromStream == -1) break // EOF
+                    if (bytesReadFromStream == 0) continue
 
-                    // 将读取的数据写入文件
-                    randomAccessFile.write(buffer, 0, bytesRead)
-                    bytesActuallyWrittenThisSession += bytesRead // 累加本次会话写入的字节数
-                    bytesSinceLastDbUpdate += bytesRead          // 累加自上次DB更新后写入的字节数
+                    randomAccessFile.write(buffer, 0, bytesReadFromStream)
+                    bytesActuallyWrittenThisSession += bytesReadFromStream
+                    bytesSinceLastDbUpdate += bytesReadFromStream
 
-                    // 计算当前内存中认为的总已下载字节数 (基于上次DB快照 + 本次会话写入)
-                    // 注意：这里用 currentTask.downloadedBytes (即 dbDownloadedBytesSnapshot) 作为基准更准确
-                    val currentTotalDownloadedInMemory = dbDownloadedBytesSnapshot + bytesActuallyWrittenThisSession
+                    // currentTask.downloadedBytes 是会话开始时的值
+                    // 最新总下载进度 = 会话开始时的进度 + 本会话已写入的字节
+                    val currentTotalDownloadedInMemory = currentTask.downloadedBytes + bytesActuallyWrittenThisSession
 
-                    // 数据库进度更新逻辑 (基于数据量)
                     if (bytesSinceLastDbUpdate >= dbUpdateThresholdBytes) {
                         downloadDao.updateDownloadedBytes(currentTask.id, currentTotalDownloadedInMemory)
-                        bytesSinceLastDbUpdate = 0 // 重置计数器
-                        Timber.v("任务 ${currentTask.id} 数据库进度更新: $currentTotalDownloadedInMemory/${currentTask.totalBytes}")
+                        bytesSinceLastDbUpdate = 0
+                        Timber.v("任务 ${currentTask.id} DB进度更新: $currentTotalDownloadedInMemory/${currentTask.totalBytes}")
                     }
 
-                    // UI Flow 发射逻辑 (基于时间，以提供平滑的UI体验)
                     val currentTime = System.currentTimeMillis()
-                    if (currentTime - lastUiEmitTime >= 1000) { // 每秒发射一次进度
+                    if (currentTime - lastUiEmitTime >= 1000) { // 每秒发射一次UI进度
                         _downloadProgressFlow.tryEmit(
                             DownloadProgress(
-                                currentTask.id,
-                                currentTotalDownloadedInMemory,
-                                currentTask.totalBytes, // 使用 currentTask 已知的总字节数
-                                DownloadStatus.DOWNLOADING,
-                                null // 正常下载中，无错误
+                                currentTask.id, currentTotalDownloadedInMemory,
+                                currentTask.totalBytes,
+                                DownloadStatus.DOWNLOADING
                             )
                         )
                         lastUiEmitTime = currentTime
                     }
                 }
-            } // inputStream.use 会在此处自动关闭输入流
+            } // inputStream.use 会自动关闭
+            // --- 下载循环结束后 (EOF 或 break) ---
+            val finalTotalDownloadedBytes = currentTask.downloadedBytes + bytesActuallyWrittenThisSession
+            downloadDao.updateDownloadedBytes(currentTask.id, finalTotalDownloadedBytes) // 关键：保存最终精确进度
+            Timber.d("任务 ${currentTask.id}: 循环结束后，最终DB进度更新为: $finalTotalDownloadedBytes")
 
-            // --- 下载循环结束后 (因读取到EOF或因状态改变而break) ---
-            // 注意：此时的 currentTask.downloadedBytes 仍然是本次会话开始前的DB快照值
-            val finalDownloadedBytesBasedOnSession = dbDownloadedBytesSnapshot + bytesActuallyWrittenThisSession
-
-            // 确保所有剩余的进度都已写入数据库
-            if (bytesSinceLastDbUpdate > 0) { // bytesSinceLastDbUpdate > 0 意味着 currentTotalDownloadedInMemory 尚未完全写入DB
-                downloadDao.updateDownloadedBytes(currentTask.id, finalDownloadedBytesBasedOnSession)
-                Timber.d("任务 ${currentTask.id}: 循环结束后，最终数据库进度更新为: $finalDownloadedBytesBasedOnSession")
-            }
-
-            // --- 最终状态检查和更新 ---
-            // 最后一次从数据库重新获取任务，以获得可能由其他操作设置的绝对最新状态
-            // (例如，如果循环中的定期DB检查导致了 'break')
             val finalTaskStateFromDb = downloadDao.getTaskById(currentTask.id)
             if (finalTaskStateFromDb == null) {
                 Timber.e("任务 ${currentTask.id} 在最终状态更新前从数据库消失。")
-                // 这是一个错误，但数据可能已部分写入。
-                // 我们没有任务记录可以更新为 FAILED。
-                // 如果可能，考虑为此 taskId 发出一个通用错误。
-                _downloadProgressFlow.tryEmit(DownloadProgress(currentTask.id, finalDownloadedBytesBasedOnSession, currentTask.totalBytes, DownloadStatus.FAILED, IOException("任务记录消失")))
+                updateTaskStatus(currentTask.id, DownloadStatus.FAILED, error = IOException("任务记录在下载结束时消失"))
                 return
             }
+            currentTask = finalTaskStateFromDb
 
-            // 如果状态仍然是 DOWNLOADING，这意味着下载是自然完成的 (EOF)
-            // 或者是被此执行上下文中的协程取消 (但不是由外部DB状态更改中断的)。
-            if (finalTaskStateFromDb.status == DownloadStatus.DOWNLOADING) {
-                val knownTotalBytes = finalTaskStateFromDb.totalBytes // 使用数据库中最新的总字节数
+            if (!currentCoroutineContext().isActive) {
+                Timber.i("任务 ${currentTask.id} 在下载循环后，但在最终状态判定前，协程被取消。当前已下载: ${currentTask.downloadedBytes}")
+                if (currentTask.status == DownloadStatus.DOWNLOADING) {
+                    // 交给外层 CancellationException 处理，或者如果到这里还没抛，则手动处理
+                    updateTaskStatus(currentTask.id, DownloadStatus.PAUSED, isNetworkPaused = currentTask.isPausedByNetwork, error = CancellationException("下载在完成检查前被取消"))
+                }
+                return;
+            }
 
-                if (knownTotalBytes > 0) { // 服务器提供了总字节数
-                    if (finalDownloadedBytesBasedOnSession < knownTotalBytes) {
-                        // 已下载字节数小于总字节数，但已到达EOF或被中断
-                        if (expectedBytesToReceiveThisSession != -1L && bytesActuallyWrittenThisSession < expectedBytesToReceiveThisSession && currentCoroutineContext().isActive) {
-                            // 如果协程仍然活跃，并且我们期望接收更多字节但没有收到 (例如服务器提前关闭连接)
-                            val errMsg =
-                                "下载不完整: $finalDownloadedBytesBasedOnSession/$knownTotalBytes。本次会话期望接收 ${expectedBytesToReceiveThisSession}，实际接收 $bytesActuallyWrittenThisSession。"
-                            Timber.e("任务 ${currentTask.id}: $errMsg")
-                            updateTaskStatus(currentTask.id, DownloadStatus.FAILED, isNetworkPaused = false, error = IOException(errMsg))
-                        } else if (currentCoroutineContext().isActive) {
-                            // 协程活跃，但已达EOF，而已下载的仍小于总量。这可能表示 Content-Length 错误或连接在未报错的情况下中断。
-                            val errMsg = "已到达EOF，但已下载字节 ($finalDownloadedBytesBasedOnSession) 少于总字节 ($knownTotalBytes)。"
-                            Timber.w("任务 ${currentTask.id}: $errMsg - 标记为 FAILED。")
-                            updateTaskStatus(currentTask.id, DownloadStatus.FAILED, isNetworkPaused = false, error = IOException(errMsg))
-                        } else {
-                            // 如果协程被取消，即使字节数不足，也应由 CancellationException 处理器处理，通常标记为 PAUSED。
-                            // 此处不应直接标记 FAILED。
-                            Timber.i("任务 ${currentTask.id} 因协程取消而中断，已下载 $finalDownloadedBytesBasedOnSession/$knownTotalBytes。状态将由取消处理器决定。")
-                        }
-                    } else if (finalDownloadedBytesBasedOnSession > knownTotalBytes) {
-                        // 已下载字节数大于报告的总字节数 (罕见，但可能发生)
-                        Timber.w("任务 ${currentTask.id}: 下载的字节数 ($finalDownloadedBytesBasedOnSession) 大于总字节数 ($knownTotalBytes)。正在修正为总字节数并标记为 COMPLETED。")
-                        downloadDao.updateProgress(currentTask.id, knownTotalBytes, knownTotalBytes) // 将进度修正为总字节数
-                        updateTaskStatus(currentTask.id, DownloadStatus.COMPLETED, isNetworkPaused = false)
-                    } else { // finalDownloadedBytesBasedOnSession == knownTotalBytes
-                        // 已下载字节数等于总字节数，下载成功完成
-                        Timber.i("任务 ${currentTask.id} 成功完成。已下载: $finalDownloadedBytesBasedOnSession / $knownTotalBytes")
-                        // 如果 updateDownloadedBytes 已正确设置，并且 totalBytes 未改变，则无需再次调用 downloadDao.updateProgress。
-                        // 但为安全起见，或如果 totalBytes 可能在此过程中被修正：
-                        downloadDao.updateProgress(currentTask.id, finalDownloadedBytesBasedOnSession, knownTotalBytes)
-                        updateTaskStatus(currentTask.id, DownloadStatus.COMPLETED, isNetworkPaused = false)
+            if (currentTask.status == DownloadStatus.DOWNLOADING) {
+                val knownTotalBytes = currentTask.totalBytes
+                if (knownTotalBytes > 0) {
+                    if (currentTask.downloadedBytes < knownTotalBytes) {
+                        val errMsg = "下载不完整: ${currentTask.downloadedBytes}/$knownTotalBytes. 期望内容长度: $expectedContentLengthFromServer, 本次会话实际写入: $bytesActuallyWrittenThisSession."
+                        Timber.e("任务 ${currentTask.id}: $errMsg")
+                        updateTaskStatus(currentTask.id, DownloadStatus.FAILED, isNetworkPaused = false, error = IOException(errMsg))
+                    } else if (currentTask.downloadedBytes > knownTotalBytes) {
+                        Timber.w("任务 ${currentTask.id}: 下载字节 (${currentTask.downloadedBytes}) > 总字节 ($knownTotalBytes). 修正并完成.")
+                        downloadDao.updateProgress(currentTask.id, knownTotalBytes, knownTotalBytes)
+                        updateTaskStatus(currentTask.id, DownloadStatus.COMPLETED)
+                    } else { // downloadedBytes == knownTotalBytes
+                        Timber.i("任务 ${currentTask.id} 成功完成。已下载: ${currentTask.downloadedBytes}/$knownTotalBytes")
+                        updateTaskStatus(currentTask.id, DownloadStatus.COMPLETED)
                     }
-                } else { // 服务器未提供总字节数 (totalBytes <= 0)
-                    Timber.i("任务 ${currentTask.id} 已完成 (初始总大小未知)。已下载: $finalDownloadedBytesBasedOnSession。标记为 COMPLETED。")
-                    // 将总字节数设置为实际下载的字节数
-                    downloadDao.updateProgress(currentTask.id, finalDownloadedBytesBasedOnSession, finalDownloadedBytesBasedOnSession)
-                    updateTaskStatus(currentTask.id, DownloadStatus.COMPLETED, isNetworkPaused = false)
+                } else {
+                    Timber.i("任务 ${currentTask.id} 完成 (总大小未知). 已下载: ${currentTask.downloadedBytes}. 标记为 COMPLETED.")
+                    downloadDao.updateTotalBytes(currentTask.id, currentTask.downloadedBytes)
+                    updateTaskStatus(currentTask.id, DownloadStatus.COMPLETED)
                 }
             } else {
-                // 如果 finalTaskStateFromDb.status 不是 DOWNLOADING，
-                // 这意味着状态已被外部因素 (例如用户暂停/取消) 改变，并且在循环的DB检查中被检测到，
-                // 或者是由于此执行上下文之外的协程取消（例如，activeDownloads[taskId]?.cancel()）。
-                // finalTaskStateFromDb 中的状态是应该被尊重的。
-                Timber.i("任务 ${currentTask.id}: 下载循环结束。最终数据库状态为 ${finalTaskStateFromDb.status}。正在发出此状态。")
-                // 通常 updateTaskStatus 已经发出了这个状态，但为确保UI同步，可以再发一次
+                Timber.i("任务 ${currentTask.id}: 下载循环结束。最终DB状态为 ${currentTask.status}。进度: ${currentTask.downloadedBytes}/${currentTask.totalBytes}")
                 _downloadProgressFlow.tryEmit(
                     DownloadProgress(
-                        finalTaskStateFromDb.id,
-                        finalTaskStateFromDb.downloadedBytes, // 使用数据库中的实际值
-                        finalTaskStateFromDb.totalBytes,
-                        finalTaskStateFromDb.status,
-                        finalTaskStateFromDb.errorDetails?.let { IOException(it) }
+                        currentTask.id, currentTask.downloadedBytes, currentTask.totalBytes,
+                        currentTask.status, currentTask.errorDetails?.let { IOException(it) }
                     )
                 )
             }
 
         } catch (e: CancellationException) {
-            // --- 处理协程取消 ---
             Timber.i(e, "任务 ${currentTask.id} 的下载被取消: ${e.message}")
-            // Job 被取消。我们需要确保数据库中的任务反映一个非 DOWNLOADING 状态。
-            // 对于用户发起的取消，如果希望允许恢复，PAUSED 是一个常见的状态。
-            // 此处调用 handleCancellationOrError 来统一处理（在您的原始代码中，这里是直接调用）
-            // 假设 handleCancellationOrError 会处理状态为 PAUSED 并记录错误。
+            // 关键: 在取消时，保存当前会话实际已下载的进度
+            val currentDownloadedBeforeError = currentTask.downloadedBytes + bytesActuallyWrittenThisSession
+            downloadDao.updateDownloadedBytes(currentTask.id, currentDownloadedBeforeError)
+
+            // isNetworkIssue false, 因为是外部/用户取消，除非特定情况
             handleCancellationOrError(currentTask.id, DownloadStatus.PAUSED, e, false)
         } catch (e: IOException) {
-            // --- 处理网络和文件IO异常 ---
             Timber.e(e, "任务 ${currentTask.id} 下载期间发生 IOException: ${e.message}")
+            val currentDownloadedBeforeError = currentTask.downloadedBytes + bytesActuallyWrittenThisSession
+            downloadDao.updateDownloadedBytes(currentTask.id, currentDownloadedBeforeError)
+
+            // isNetworkIssue 可以根据 isNetworkConnected 判断
             handleCancellationOrError(currentTask.id, DownloadStatus.FAILED, e, !isNetworkConnected)
         } catch (e: Exception) {
-            // --- 处理其他意外异常 ---
             Timber.e(e, "任务 ${currentTask.id} 下载期间发生意外错误: ${e.message}")
+            val currentDownloadedBeforeError = currentTask.downloadedBytes + bytesActuallyWrittenThisSession
+            downloadDao.updateDownloadedBytes(currentTask.id, currentDownloadedBeforeError)
+
             handleCancellationOrError(currentTask.id, DownloadStatus.FAILED, e, !isNetworkConnected)
         } finally {
-            // --- 清理资源 ---
             try {
-                randomAccessFile?.close() // 关闭文件
+                randomAccessFile?.close()
             } catch (e: IOException) {
                 Timber.e(e, "为任务 ${currentTask.id} 关闭 randomAccessFile 时出错")
             }
             try {
-                response?.close() // 关闭网络响应
-            } catch (e: Exception) { // OkHttp 的 close 在线程中断时可能抛出 RuntimeException
+                response?.close()
+            } catch (e: Exception) {
                 Timber.e(e, "为任务 ${currentTask.id} 关闭 response 时出错")
             }
             Timber.d("任务 ${currentTask.id} 的 executeDownload 执行路径结束。")
-            // 从 activeDownloads 中移除 Job (如果它还在那里)
-            // 注意：updateTaskStatus 到最终状态 (FAILED, CANCELLED, COMPLETED) 时应该已经移除了它。
-            // 这主要是一个保障措施，以防在状态更新前就发生异常导致跳出。
-            activeDownloads.remove(currentTask.id)?.let {
-                Timber.d("任务 ${currentTask.id} 的 Job 已在 executeDownload 的 finally 块中从 activeDownloads 映射中显式移除。")
+            // activeDownloads 的清理主要由 updateTaskStatus (对于终态 FAILED, COMPLETED, CANCELLED)
+            // 或 pauseDownload/cancelDownload (通过取消Job间接触发 handleCancellationOrError) 处理。
+            // 确保清理
+            val finalTaskCheck = downloadDao.getTaskById(currentTask.id) // 重新获取以检查最终状态
+            if (finalTaskCheck == null ||
+                (finalTaskCheck.status != DownloadStatus.DOWNLOADING && finalTaskCheck.status != DownloadStatus.PENDING)
+            ) {
+                activeDownloads.remove(currentTask.id)
             }
         }
-    }
+    } // end of executeDownload
 
     /**
      * 处理下载任务遇到取消 (Cancellation) 或错误 (Error) 后的最终状态。
@@ -1507,64 +1441,48 @@ object DownloadManager {
      */
     private suspend fun handleCancellationOrError(
         taskId: String,
-        statusToSet: DownloadStatus, // 目标状态，通常是 FAILED 或 PAUSED
+        statusToSet: DownloadStatus,
         error: Throwable?,
-        isNetworkIssue: Boolean
+        isNetworkIssue: Boolean // 这个参数很重要
     ) {
-        checkInitialized() // 确保 DownloadManager 已初始化
-
-        // 从数据库获取任务的当前状态
+        checkInitialized()
         val currentTaskState = downloadDao.getTaskById(taskId)
 
         if (currentTaskState != null) {
-            // 任务在数据库中存在
-
-            // 核心逻辑：只在特定条件下更新任务状态，以避免覆盖用户手动设置的最终状态
-            // 条件1: 任务当前正在活跃下载 (DOWNLOADING) 或等待下载 (PENDING)。
-            // 条件2: 或者，我们打算将任务设置为 FAILED，并且任务当前是 PAUSED 状态
-            //         (这种情况允许在重试 PAUSED 任务时，如果再次失败，则将其状态从 PAUSED 更新为 FAILED)。
+            // 只有当任务还在下载、等待，或者要从活动状态变为PAUSED/FAILED时才更新
             if (currentTaskState.status == DownloadStatus.DOWNLOADING ||
                 currentTaskState.status == DownloadStatus.PENDING ||
-                (statusToSet == DownloadStatus.FAILED && currentTaskState.status == DownloadStatus.PAUSED)
+                (statusToSet == DownloadStatus.FAILED && (currentTaskState.status == DownloadStatus.PAUSED || currentTaskState.status == DownloadStatus.DOWNLOADING || currentTaskState.status == DownloadStatus.PENDING)) || // 允许从PAUSED到FAILED
+                (statusToSet == DownloadStatus.PAUSED && (currentTaskState.status == DownloadStatus.DOWNLOADING || currentTaskState.status == DownloadStatus.PENDING))
             ) {
-                Timber.w("任务 $taskId 当前状态为 ${currentTaskState.status}，由于错误/取消 (${error?.message})，将设置状态为 $statusToSet。")
+                Timber.w("任务 $taskId 当前状态 ${currentTaskState.status}, 因错误/取消 (${error?.javaClass?.simpleName}: ${error?.message}), 将设置状态为 $statusToSet. isNetworkIssue: $isNetworkIssue")
+
+                val finalIsNetworkPaused = when (statusToSet) {
+                    DownloadStatus.PAUSED -> isNetworkIssue // 用户取消时 isNetworkIssue=false, 网络问题时 isNetworkIssue=true
+                    DownloadStatus.FAILED -> if (error is IOException && !isNetworkConnected) true else currentTaskState.isPausedByNetwork
+                    else -> currentTaskState.isPausedByNetwork
+                }
                 updateTaskStatus(
                     taskId,
                     statusToSet,
-                    // 设置 isPausedByNetwork 标记的逻辑：
-                    // - 如果目标状态是 PAUSED 并且明确是网络问题 (isNetworkIssue is true)，则将 isPausedByNetwork 设为 true。
-                    // - 否则 (目标状态不是 PAUSED，或者不是网络问题，或者 isNetworkIssue 是 false)，
-                    //   则保留 currentTaskState 中已有的 isPausedByNetwork 值。
-                    //   这意味着如果任务之前因为网络问题被暂停，这个标记会得到保留；
-                    //   如果是因为其他原因被暂停 (例如用户手动暂停)，或者现在要设置为 FAILED，则该标记不会被错误地设置为 true。
-                    isNetworkPaused = if (statusToSet == DownloadStatus.PAUSED && isNetworkIssue) true else currentTaskState.isPausedByNetwork,
+                    isNetworkPaused = finalIsNetworkPaused,
                     error = error
                 )
             } else {
-                // 如果任务当前状态不是 DOWNLOADING, PENDING, 或 (当 statusToSet 为 FAILED 时的 PAUSED)，
-                // 例如任务可能已经被用户手动 CANCELLED, PAUSED (非因重试失败), 或已 COMPLETED。
-                // 在这种情况下，我们不应该从 executeDownload 的 catch 块中覆盖这个已有的状态。
                 Timber.i(
-                    "任务 $taskId 遇到错误/取消。其当前数据库状态为 ${currentTaskState.status}。 不会从 executeDownload 的 catch 块中用 $statusToSet 覆盖它。 错误信息: ${error?.message}"
+                    "任务 $taskId 遇到错误/取消. DB状态: ${currentTaskState.status}. 不会用 $statusToSet 覆盖. Error: ${error?.message}"
                 )
-                // 尽管不覆盖状态，但仍然需要发出一个 DownloadProgress 事件，
-                // 以确保UI层能够获取到数据库中最新的、正确的状态。
+                // 仅发出当前DB状态，但使用传入的error（如果存在）
                 _downloadProgressFlow.tryEmit(
                     DownloadProgress(
-                        currentTaskState.id,
-                        currentTaskState.downloadedBytes,
-                        currentTaskState.totalBytes,
-                        currentTaskState.status, // 发射数据库中的当前状态
-                        // 优先使用数据库中已有的错误详情 (errorDetails)，如果不存在，则使用传入的 error 对象
-                        currentTaskState.errorDetails?.let { IOException(it) } ?: error?.let { IOException(it.message, it) }
+                        currentTaskState.id, currentTaskState.downloadedBytes, currentTaskState.totalBytes,
+                        currentTaskState.status, error ?: currentTaskState.errorDetails?.let { IOException(it) }
                     )
                 )
             }
         } else {
-            // 任务在数据库中未找到
-            Timber.e("在处理错误/取消 (${error?.message}) 后的最终状态时，未在数据库中找到任务 $taskId。")
-            // 即使任务记录不存在，也尝试发出一个状态，表明这个 taskId 尝试进入了 statusToSet 状态。
-            // 这对于UI层可能仍然有用，可以提示用户某个操作失败了，即使没有完整的任务数据。
+            Timber.e("处理错误/取消 (${error?.message}) 时未找到任务 $taskId.")
+            // 任务不存在，但仍尝试发出一个表示失败的进度事件
             _downloadProgressFlow.tryEmit(DownloadProgress(taskId, 0, 0, statusToSet, error))
         }
     }
