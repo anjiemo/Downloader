@@ -397,95 +397,125 @@ object DownloadManager {
     }
 
     /**
-     * Enqueues a new download request or handles an existing task for the same file.
+     * 将新的下载请求加入队列，或处理针对同一文件的现有任务。
      *
-     * If a task for the same filePath already exists:
-     * - If COMPLETED: Emits progress and returns existing ID.
-     * - If FAILED or CANCELLED: Resets the task and re-enqueues it as PENDING.
-     * - If PAUSED, DOWNLOADING, or PENDING: Emits progress and returns existing ID (does not re-enqueue).
+     * 如果相同 filePath 的任务已存在：
+     * - 如果是 COMPLETED：发出进度并返回现有 ID。
+     * - 如果是 FAILED 或 CANCELLED：重置任务并将其重新排队为 PENDING。
+     * - 如果是 PAUSED、DOWNLOADING 或 PENDING：发出进度并返回现有 ID (不重新排队)。
      *
-     * If no task exists, creates a new one, saves it, and enqueues it.
+     * 如果不存在任务，则创建一个新任务，保存它，并将其加入队列。
      *
-     * @param url The URL of the file to download.
-     * @param dirPath The directory path where the file should be saved.
-     * @param fileName The name of the file.
-     * @return The ID of the download task.
-     * @throws IOException if the directory cannot be created.
-     * @throws IllegalStateException if the task cannot be saved or retrieved after enqueue.
+     * @param url 要下载的文件的 URL。
+     * @param dirPath 文件应保存到的目录路径。
+     * @param fileName 文件名。
+     * @return 下载任务的 ID。
+     * @throws IOException 如果无法创建目录。
+     * @throws IllegalStateException 如果在入队后无法保存或检索任务。
      */
     suspend fun enqueueNewDownload(url: String, dirPath: String, fileName: String): String {
-        checkInitialized()
+        checkInitialized() // 检查 DownloadManager 是否已初始化
         val directory = File(dirPath)
         if (!directory.exists()) {
             if (!directory.mkdirs()) {
-                Timber.e("Failed to create directory: $dirPath")
-                throw IOException("Failed to create directory: $dirPath")
+                Timber.e("创建目录失败: $dirPath")
+                throw IOException("创建目录失败: $dirPath")
             }
         }
         val filePath = File(dirPath, fileName).absolutePath
-        var existingTask = downloadDao.getTaskByFilePath(filePath) // Use a different variable name
+        var existingTask = downloadDao.getTaskByFilePath(filePath) // 根据文件路径查找现有任务
 
         if (existingTask != null) {
-            Timber.i("Task for file '$fileName' at '$dirPath' already exists with ID ${existingTask.id}, status: ${existingTask.status}.")
+            Timber.i("文件 '$fileName' 在 '$dirPath' 的任务已存在，ID 为 ${existingTask.id}，状态为: ${existingTask.status}。")
             when (existingTask.status) {
                 DownloadStatus.COMPLETED -> {
-                    Timber.i("Task ${existingTask.id} is already completed. Emitting progress and returning existing ID.")
-                    _downloadProgressFlow.tryEmit(DownloadProgress(existingTask.id, existingTask.downloadedBytes, existingTask.totalBytes, existingTask.status))
-                    return existingTask.id
+                    Timber.i("任务 ${existingTask.id} 已完成。发出进度并返回现有 ID。")
+                    // 发送当前已完成的状态和进度
+                    _downloadProgressFlow.tryEmit(
+                        DownloadProgress(
+                            existingTask.id,
+                            existingTask.downloadedBytes,
+                            existingTask.totalBytes,
+                            existingTask.status
+                        )
+                    )
+                    return existingTask.id // 直接返回现有任务ID
                 }
 
                 DownloadStatus.FAILED, DownloadStatus.CANCELLED -> {
-                    Timber.i("Task ${existingTask.id} was ${existingTask.status}. Resetting and re-enqueueing.")
-                    // Create a new task object for update, preserving ID
+                    Timber.i("任务 ${existingTask.id} 状态为 ${existingTask.status}。正在重置并重新入队。")
+                    // 对于失败或已取消的任务，我们重置它并重新尝试
+                    // 创建一个新的任务对象用于更新，保留 ID，并重置相关下载参数
                     existingTask = existingTask.copy(
-                        url = url, // Update URL in case it changed
-                        status = DownloadStatus.PENDING,
-                        downloadedBytes = 0L,
-                        totalBytes = 0L,
-                        eTag = null,
-                        lastModified = null,
-                        isPausedByNetwork = false,
-                        errorDetails = null,
-                        createdAt = System.currentTimeMillis() // Reset creation time or update time
+                        url = url, // 更新 URL，以防其发生变化
+                        status = DownloadStatus.PENDING, // 状态设置为 PENDING
+                        downloadedBytes = 0L,            // 重置已下载字节
+                        totalBytes = 0L,                 // 重置总字节数
+                        eTag = null,                     // 清除 ETag
+                        lastModified = null,             // 清除 LastModified
+                        isPausedByNetwork = false,       // 清除网络暂停标记
+                        errorDetails = null,             // 清除错误详情
+                        createdAt = System.currentTimeMillis() // 可以选择更新创建时间或将其视为“重新激活”时间
                     )
-                    downloadDao.insertOrUpdateTask(existingTask) // Update the existing task
+                    downloadDao.insertOrUpdateTask(existingTask) // 更新数据库中的任务
                 }
 
                 DownloadStatus.PAUSED, DownloadStatus.DOWNLOADING, DownloadStatus.PENDING -> {
-                    Timber.i("Task ${existingTask.id} is already ${existingTask.status}. Not re-enqueueing. Emitting current state.")
+                    Timber.i("任务 ${existingTask.id} 已经处于 ${existingTask.status} 状态。不重新入队。发出当前状态。")
+                    // 如果任务已在进行中或等待中，则不重新创建或修改，仅发出当前状态
                     _downloadProgressFlow.tryEmit(
                         DownloadProgress(
                             existingTask.id,
                             existingTask.downloadedBytes,
                             existingTask.totalBytes,
                             existingTask.status,
-                            existingTask.errorDetails?.let { IOException(it) })
+                            existingTask.errorDetails?.let { IOException(it) } // 如果有错误，也一并发出
+                        )
                     )
-                    return existingTask.id
+                    return existingTask.id // 返回现有任务ID
                 }
             }
         } else {
-            // No existing task, create a new one
+            // 没有找到现有任务，创建一个新的下载任务
+            Timber.i("文件 '$fileName' 在 '$dirPath' 不存在现有任务。正在创建新任务。")
             existingTask = DownloadTask(url = url, filePath = filePath, fileName = fileName)
-            downloadDao.insertOrUpdateTask(existingTask) // Insert the new task
+            downloadDao.insertOrUpdateTask(existingTask) // 将新任务插入数据库
         }
 
-        // Retrieve the task again to ensure we have the version from the DB (especially its ID if new)
-        val taskToProcess = downloadDao.getTaskByFilePath(filePath) ?: throw IllegalStateException("Failed to save or retrieve task after enqueue: $filePath")
+        // 无论是更新的旧任务还是新创建的任务，都需要从数据库重新获取一次
+        // 这样可以确保我们拥有的是包含正确ID（特别是对于新任务）和所有数据库默认值的最新版本
+        val taskToProcess = downloadDao.getTaskByFilePath(filePath)
+            ?: throw IllegalStateException("在入队后无法保存或检索任务: $filePath")
 
-        Timber.i("Task ${taskToProcess.id} (${taskToProcess.fileName}) processed for enqueue. Status: ${taskToProcess.status}. URL: ${taskToProcess.url}")
-        _downloadProgressFlow.tryEmit(DownloadProgress(taskToProcess.id, taskToProcess.downloadedBytes, taskToProcess.totalBytes, taskToProcess.status))
+        Timber.i("任务 ${taskToProcess.id} (${taskToProcess.fileName}) 已处理并准备入队。状态: ${taskToProcess.status}。 URL: ${taskToProcess.url}")
+        // 发出任务的初始状态 (通常是 PENDING)
+        _downloadProgressFlow.tryEmit(
+            DownloadProgress(
+                taskToProcess.id,
+                taskToProcess.downloadedBytes,
+                taskToProcess.totalBytes,
+                taskToProcess.status
+            )
+        )
 
-        if (taskToProcess.status == DownloadStatus.PENDING) { // Only send PENDING to channel
+        // 仅当任务确实处于 PENDING 状态时才将其发送到处理队列
+        if (taskToProcess.status == DownloadStatus.PENDING) {
             if (!isNetworkConnected) {
-                Timber.w("Network is not connected. Task ${taskToProcess.id} (${taskToProcess.fileName}) will be marked as PAUSED (due to network).")
-                updateTaskStatus(taskToProcess.id, DownloadStatus.PAUSED, isNetworkPaused = true, error = IOException("Network unavailable at enqueue time"))
+                // 如果当前没有网络连接，则不将任务放入下载队列，而是将其标记为因网络暂停
+                Timber.w("网络未连接。任务 ${taskToProcess.id} (${taskToProcess.fileName}) 将被标记为 PAUSED (因网络原因)。")
+                updateTaskStatus(
+                    taskToProcess.id,
+                    DownloadStatus.PAUSED,
+                    isNetworkPaused = true,
+                    error = IOException("入队时网络不可用")
+                )
             } else {
-                Timber.d("Network connected. Task ${taskToProcess.id} (${taskToProcess.fileName}) is PENDING, adding to queue.")
+                // 网络已连接，将任务 ID 发送到 taskQueueChannel，由任务处理器协程处理
+                Timber.d("网络已连接。任务 ${taskToProcess.id} (${taskToProcess.fileName}) 状态为 PENDING，正在添加到队列。")
                 taskQueueChannel.send(taskToProcess.id)
             }
         }
-        return taskToProcess.id
+        return taskToProcess.id // 返回处理后的任务 ID
     }
 
     suspend fun pauseDownload(taskId: String, byUser: Boolean = true) {
