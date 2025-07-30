@@ -574,93 +574,176 @@ object DownloadManager {
         }
     }
 
+    /**
+     * 恢复指定的下载任务。
+     *
+     * 仅当任务处于 PAUSED 或 FAILED 状态时才能恢复。
+     * 如果网络未连接，任务将被标记为 PAUSED (因网络原因) 并且不会被恢复。
+     * 成功恢复的任务将被设置为 PENDING 状态并添加到下载队列。
+     *
+     * @param taskId 要恢复的任务的 ID。
+     */
     suspend fun resumeDownload(taskId: String) {
-        checkInitialized()
-        val task = downloadDao.getTaskById(taskId)
-        Timber.i("Attempting to resume download for task $taskId. Current DB status: ${task?.status}, isPausedByNetwork: ${task?.isPausedByNetwork}, error: ${task?.errorDetails}")
+        checkInitialized() // 检查 DownloadManager 是否已初始化
+        val task = downloadDao.getTaskById(taskId) // 从数据库获取任务信息
+        Timber.i("尝试恢复任务 $taskId。当前数据库状态: ${task?.status}，isPausedByNetwork: ${task?.isPausedByNetwork}，错误: ${task?.errorDetails}")
 
         if (task != null) {
+            // 仅当任务处于 PAUSED 或 FAILED 状态时才尝试恢复
             if (task.status == DownloadStatus.PAUSED || task.status == DownloadStatus.FAILED) {
+                // 检查网络连接
                 if (!isNetworkConnected) {
-                    Timber.w("Cannot resume task $taskId, network is disconnected. Ensuring it's marked as network-paused.")
+                    Timber.w("无法恢复任务 $taskId，网络已断开。确保将其标记为网络暂停。")
+                    // 如果任务当前不是“因网络暂停”的 PAUSED 状态，则更新它
+                    // 这可以处理从 FAILED 状态尝试在无网络时恢复的情况，或者从非网络原因的 PAUSED 状态尝试恢复的情况
                     if (!(task.status == DownloadStatus.PAUSED && task.isPausedByNetwork)) {
-                        updateTaskStatus(taskId, DownloadStatus.PAUSED, isNetworkPaused = true, error = IOException("Attempted resume while network offline. Original error: ${task.errorDetails}"))
+                        updateTaskStatus(
+                            taskId,
+                            DownloadStatus.PAUSED,
+                            isNetworkPaused = true,
+                            error = IOException("尝试在网络离线时恢复。原始错误: ${task.errorDetails}")
+                        )
                     } else {
+                        // 如果任务已经是网络暂停状态，则仅发出当前状态，因为网络仍然不可用
                         _downloadProgressFlow.tryEmit(
                             DownloadProgress(
                                 task.id,
                                 task.downloadedBytes,
                                 task.totalBytes,
                                 task.status,
-                                IOException("Network unavailable. Original error: ${task.errorDetails}")
+                                IOException("网络不可用。原始错误: ${task.errorDetails}")
                             )
                         )
                     }
-                    return
+                    return // 网络未连接，无法恢复
                 }
 
-                Timber.d("Network connected. Setting task $taskId to PENDING for resumption.")
-                // Clear isPausedByNetwork and errorDetails when resuming/retrying
+                // 网络已连接，可以将任务设置为 PENDING 以进行恢复
+                Timber.d("网络已连接。正在将任务 $taskId 设置为 PENDING 以进行恢复。")
+                // 在恢复/重试时，清除 isPausedByNetwork 标记和 errorDetails
                 updateTaskStatus(taskId, DownloadStatus.PENDING, isNetworkPaused = false, error = null)
 
-                // The task status is now PENDING in DB. Add to channel.
-                // Re-fetch is not strictly necessary here if updateTaskStatus already emitted,
-                // but taskQueueChannel.send uses the taskId.
+                // 任务状态现在在数据库中是 PENDING。将其添加到下载通道 (channel)。
+                // 如果 updateTaskStatus 已经发出了状态，这里重新获取任务不是严格必要的，
+                // 但是 taskQueueChannel.send 使用的是 taskId，并且最好确认状态确实已更新。
                 val taskAfterPendingUpdate = downloadDao.getTaskById(taskId)
                 if (taskAfterPendingUpdate?.status == DownloadStatus.PENDING) {
-                    taskQueueChannel.send(taskId)
-                    Timber.i("Task $taskId set to PENDING and added to queue for resumption.")
+                    taskQueueChannel.send(taskId) // 将任务 ID 发送到队列
+                    Timber.i("任务 $taskId 已设置为 PENDING 并添加到队列以进行恢复。")
                 } else {
-                    Timber.w("Task $taskId was set to PENDING, but its status is now ${taskAfterPendingUpdate?.status}. Not adding to queue. This might indicate a rapid concurrent update.")
+                    // 这种情况可能在极少数并发场景下发生，例如在 updateTaskStatus 和 getTaskById 之间任务状态再次被改变
+                    Timber.w("任务 $taskId 被设置为 PENDING 后，其状态现在是 ${taskAfterPendingUpdate?.status}。未添加到队列。这可能表示快速的并发更新。")
                 }
 
             } else {
-                Timber.w("Task $taskId cannot be resumed from current status: ${task.status}. Emitting current state.")
-                _downloadProgressFlow.tryEmit(DownloadProgress(task.id, task.downloadedBytes, task.totalBytes, task.status, task.errorDetails?.let { IOException(it) }))
+                // 如果任务不处于 PAUSED 或 FAILED 状态，则无法恢复
+                Timber.w("任务 $taskId 无法从当前状态恢复: ${task.status}。正在发出当前状态。")
+                _downloadProgressFlow.tryEmit(
+                    DownloadProgress(
+                        task.id,
+                        task.downloadedBytes,
+                        task.totalBytes,
+                        task.status,
+                        task.errorDetails?.let { IOException(it) }
+                    )
+                )
             }
         } else {
-            Timber.w("Task $taskId not found for resuming.")
+            Timber.w("未找到要恢复的任务 $taskId。")
         }
     }
 
+    /**
+     * 取消指定的下载任务。
+     *
+     * 此函数会执行以下操作：
+     * 1. 如果任务当前正在下载 (存在于 `activeDownloads` 中)，则尝试取消其关联的协程 Job。
+     * 2. 从数据库中获取任务信息。
+     * 3. 如果任务存在，将其状态更新为 `DownloadStatus.CANCELLED`。
+     * 4. 尝试删除与该任务关联的本地文件。
+     * 5. 记录相应的日志信息。
+     *
+     * @param taskId 要取消的任务的 ID。
+     */
     suspend fun cancelDownload(taskId: String) {
-        checkInitialized()
-        Timber.i("Attempting to cancel download for task $taskId.")
-        activeDownloads[taskId]?.cancel(CancellationException("Download cancelled by user"))
-        // Task processor might still pick it up if it was PENDING and immediately process its cancellation.
-        // It's important that executeDownload also checks for status.
+        checkInitialized() // 确保 DownloadManager 已初始化
+        Timber.i("尝试取消任务 $taskId 的下载。")
 
+        // 步骤 1: 取消活跃的下载 Job (如果存在)
+        // 这会尝试中断 executeDownload 函数中正在进行的下载操作。
+        // 提供一个 CancellationException，说明是用户取消的。
+        activeDownloads[taskId]?.cancel(CancellationException("下载被用户取消"))
+        // 注意：如果任务此时处于 PENDING 状态且尚未被任务处理器 (task processor) 拾取，
+        // 任务处理器在稍后拾取它时，executeDownload 内部的状态检查机制会处理其 CANCELLED 状态。
+        // 因此，executeDownload 能够正确处理在它开始执行前就被取消的任务。
+
+        // 步骤 2: 从数据库获取任务信息
         val task = downloadDao.getTaskById(taskId)
+
         if (task != null) {
-            // Update status to CANCELLED first.
+            // 任务在数据库中存在
+
+            // 步骤 3: 首先将数据库中的任务状态更新为 CANCELLED。
+            // 这样做可以确保即使后续的文件删除操作失败，任务的状态也是正确的 (CANCELLED)。
+            // isNetworkPaused 设置为 false，因为取消操作与网络状态无关。
+            // error 设置为 null，因为这是用户主动取消，不视为错误。
             updateTaskStatus(taskId, DownloadStatus.CANCELLED, isNetworkPaused = false, error = null)
 
-            // Then delete the file.
+            // 步骤 4: 然后删除与此任务关联的本地文件。
             try {
-                val file = File(task.filePath)
-                if (file.exists()) {
-                    if (file.delete()) {
-                        Timber.d("Deleted file for cancelled task $taskId at ${task.filePath}")
+                val file = File(task.filePath) // 根据任务记录中的文件路径创建 File 对象
+                if (file.exists()) { // 检查文件是否存在
+                    if (file.delete()) { // 尝试删除文件
+                        Timber.d("已删除已取消任务 $taskId 的文件，路径: ${task.filePath}")
                     } else {
-                        Timber.w("Failed to delete file for cancelled task $taskId at ${task.filePath}")
+                        // 文件存在但删除失败 (可能由于权限问题、文件被占用等)
+                        Timber.w("删除已取消任务 $taskId 的文件失败，路径: ${task.filePath}")
+                        // 即使文件删除失败，任务状态在数据库中仍然是 CANCELLED。
+                        // 应用程序可以根据需要实现后续的文件清理机制。
                     }
                 } else {
-                    Timber.d("File for cancelled task $taskId not found at ${task.filePath}, no deletion needed.")
+                    // 文件路径指向的文件不存在，无需删除。
+                    Timber.d("未找到已取消任务 $taskId 的文件，路径: ${task.filePath}，无需删除。")
                 }
             } catch (e: Exception) {
-                Timber.e(e, "Error deleting file for cancelled task $taskId")
+                // 捕获在文件删除过程中可能发生的任何异常 (例如 SecurityException)。
+                Timber.e(e, "删除已取消任务 $taskId 的文件时出错")
             }
-            Timber.i("Task $taskId cancelled successfully.")
+            Timber.i("任务 $taskId 已成功标记为取消状态，并尝试了文件删除。")
         } else {
-            Timber.w("Task $taskId not found for cancellation.")
+            // 任务在数据库中未找到
+            Timber.w("未找到要取消的任务 $taskId。")
+            // 如果任务未找到，它可能已被其他操作删除，或者提供的 taskId 无效。
+            // 尽管如此，我们仍然可以尝试发出一个表示取消意图的通用状态通知，
+            // 即使没有具体的任务数据可以关联。这有助于UI层统一处理。
+            _downloadProgressFlow.tryEmit(
+                DownloadProgress(
+                    taskId,
+                    0L, // downloadedBytes 未知
+                    0L, // totalBytes 未知
+                    DownloadStatus.CANCELLED, // 状态设置为 CANCELLED
+                    IOException("尝试取消时未找到任务 $taskId") // 附带一个错误信息
+                )
+            )
         }
     }
 
+    /**
+     * 重试指定的下载任务。
+     *
+     * 此函数本质上是对 `resumeDownload` 函数的调用。`resumeDownload` 负责处理
+     * 处于 `FAILED` 或 `PAUSED` 状态的任务，将其状态设置为 `PENDING` 以便重新加入下载队列。
+     * 在此过程中，它还会清除任务的错误详情 (`errorDetails`) 和网络暂停标记 (`isPausedByNetwork`)。
+     *
+     * @param taskId 要重试的下载任务的 ID。
+     */
     suspend fun retryDownload(taskId: String) {
-        checkInitialized()
-        Timber.i("Retrying download for task $taskId.")
-        // resumeDownload will handle FAILED or PAUSED state and set it to PENDING.
-        // It also clears error details and isPausedByNetwork.
+        checkInitialized() // 确保 DownloadManager 已初始化
+        Timber.i("正在为任务 $taskId 尝试重试下载。")
+
+        // 调用 resumeDownload 函数。
+        // resumeDownload 会处理 FAILED 或 PAUSED 状态，并将任务设置为 PENDING。
+        // 它同时也会清除错误详情 (error details) 和 isPausedByNetwork 标记。
         resumeDownload(taskId)
     }
 
