@@ -518,23 +518,59 @@ object DownloadManager {
         return taskToProcess.id // 返回处理后的任务 ID
     }
 
+    /**
+     * 暂停指定的下载任务。
+     *
+     * @param taskId 要暂停的任务的 ID。
+     * @param byUser 指示暂停是由用户（true）还是系统（false，例如网络断开）发起的。
+     *               这会影响暂停时是否保留网络暂停标记和错误详情。
+     */
     suspend fun pauseDownload(taskId: String, byUser: Boolean = true) {
-        checkInitialized()
-        Timber.i("Attempting to pause download for task $taskId by ${if (byUser) "user" else "system"}.")
-        activeDownloads[taskId]?.cancel(CancellationException("Download paused by ${if (byUser) "user" else "system"}"))
+        checkInitialized() // 检查 DownloadManager 是否已初始化
+        Timber.i("尝试暂停任务 $taskId，操作者: ${if (byUser) "用户" else "系统"}.")
 
-        val task = downloadDao.getTaskById(taskId)
+        // 取消与此任务关联的活动下载 Job (如果存在)
+        // 这将中断 executeDownload 中的下载循环 (如果正在运行)
+        activeDownloads[taskId]?.cancel(CancellationException("下载被 ${if (byUser) "用户" else "系统"} 暂停"))
+
+        val task = downloadDao.getTaskById(taskId) // 从数据库获取任务信息
         if (task != null) {
+            // 仅当任务当前处于 PENDING 或 DOWNLOADING 状态时才将其更新为 PAUSED
+            // 其他状态 (如 COMPLETED, FAILED, CANCELLED, PAUSED) 不应由此方法更改为 PAUSED
             if (task.status == DownloadStatus.PENDING || task.status == DownloadStatus.DOWNLOADING) {
+                // 如果是用户暂停，则 isNetworkPaused 应为 false，且不应设置新的 error
+                // 如果是系统暂停 (例如网络断开)，则保留之前的 isPausedByNetwork 状态 (通常应为 true)
+                // 和之前的 errorDetails (如果存在)
                 val newIsNetworkPaused = if (byUser) false else task.isPausedByNetwork
-                updateTaskStatus(taskId, DownloadStatus.PAUSED, isNetworkPaused = newIsNetworkPaused, error = if (byUser) null else task.errorDetails?.let { IOException(it) })
-                Timber.i("Task $taskId paused successfully. IsNetworkPaused set to: $newIsNetworkPaused")
+                val errorForStatusUpdate = if (byUser) {
+                    null // 用户暂停时不记录错误
+                } else {
+                    task.errorDetails?.let { IOException(it) } // 系统暂停时保留现有错误
+                }
+
+                updateTaskStatus(
+                    taskId,
+                    DownloadStatus.PAUSED,
+                    isNetworkPaused = newIsNetworkPaused,
+                    error = errorForStatusUpdate
+                )
+                Timber.i("任务 $taskId 成功暂停。isNetworkPaused 设置为: $newIsNetworkPaused")
             } else {
-                Timber.w("Task $taskId cannot be paused. Current status: ${task.status}. Emitting current state.")
-                _downloadProgressFlow.tryEmit(DownloadProgress(task.id, task.downloadedBytes, task.totalBytes, task.status, task.errorDetails?.let { IOException(it) }))
+                // 如果任务已处于其他状态 (例如已经 PAUSED, FAILED, COMPLETED)，
+                // 则不更改其状态，但仍然发出当前状态以通知监听器
+                Timber.w("无法暂停任务 $taskId。当前状态: ${task.status}。正在发出当前状态。")
+                _downloadProgressFlow.tryEmit(
+                    DownloadProgress(
+                        task.id,
+                        task.downloadedBytes,
+                        task.totalBytes,
+                        task.status,
+                        task.errorDetails?.let { IOException(it) }
+                    )
+                )
             }
         } else {
-            Timber.w("Task $taskId not found for pausing.")
+            Timber.w("未找到要暂停的任务 $taskId。")
         }
     }
 
