@@ -213,85 +213,57 @@ object DownloadManager {
      * 自动的网络恢复和暂停功能将无法工作。
      */
     private fun registerNetworkCallback() {
-        checkInitialized() // 确保 DownloadManager 已初始化
+        checkInitialized()
 
-        // 构建一个 NetworkRequest，用于指定我们感兴趣的网络能力
-        // NET_CAPABILITY_INTERNET 表示我们关心具有互联网访问能力的网络
         val networkRequest = NetworkRequest.Builder()
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) // 监听具有互联网访问能力的网络连接变化
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .build()
 
-        // 创建 ConnectivityManager.NetworkCallback 的匿名内部类实例
         val networkCallback = object : ConnectivityManager.NetworkCallback() {
-            /**
-             * 当一个满足 NetworkRequest 条件的网络连接变为可用时调用。
-             *
-             * @param network 变为可用的 Network 对象。
-             */
             override fun onAvailable(network: Network) {
                 super.onAvailable(network)
-                val wasConnected = isNetworkConnected // 记录回调触发前是否已连接
+                val callbackTime = System.currentTimeMillis()
+                val previousIsConnected = isNetworkConnected // 记录回调前的状态
+                Timber.d("NetworkCallback.onAvailable: 网络 $network 变为可用 (回调时刻: $callbackTime)。之前的 isNetworkConnected = $previousIsConnected。")
 
-                // 再次确认网络是否真的可用并且是我们期望的类型
-                // 因为 onAvailable 可能针对任何满足条件的网络，我们需要检查当前活动的那个
                 val currentActiveNetwork = connectivityManager.activeNetwork
                 val capabilities = currentActiveNetwork?.let { connectivityManager.getNetworkCapabilities(it) }
 
-                // 检查获取到的 capabilities 是否不为 null，并且至少包含一种我们支持的传输类型
                 val trulyConnected = capabilities != null && (
                         capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
                                 capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ||
                                 capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
                         )
+                Timber.d("NetworkCallback.onAvailable: currentActiveNetwork = ${currentActiveNetwork?.toString()}, capabilities = ${capabilities?.toString()}, trulyConnected = $trulyConnected")
 
                 if (trulyConnected) {
-                    isNetworkConnected = true // 标记全局网络状态为已连接
-                    if (!wasConnected) { // 仅当之前是断开状态，现在变为连接状态时才处理
-                        Timber.i("网络重新连接 (onAvailable 触发于网络: $network)。")
-                        downloadScope.launch { // 在 DownloadManager 的协程作用域中启动
-                            handleNetworkReconnection() // 处理网络重连逻辑
+                    isNetworkConnected = true // 设置全局网络状态为已连接
+                    if (!previousIsConnected) { // 仅当之前是断开状态，现在变为连接状态时才处理
+                        Timber.i("NetworkCallback.onAvailable: 网络从断开 -> 连接 (isNetworkConnected 从 $previousIsConnected -> true)。触发于网络 $network。准备调用 handleNetworkReconnection。")
+                        downloadScope.launch {
+                            handleNetworkReconnection()
                         }
                     } else {
-                        // 如果之前已经是连接状态，这次 onAvailable 可能只是针对某个特定网络接口的确认，或者是一个冗余的回调
-                        Timber.d("网络 onAvailable 回调触发于网络 $network，但之前已被认为是连接状态。")
+                        Timber.d("NetworkCallback.onAvailable: isNetworkConnected 已为 true (之前为 $previousIsConnected)。可能是一个冗余回调或网络接口的确认。网络 $network。")
                     }
                 } else {
-                    // 虽然 onAvailable 被调用，但 getNetworkCapabilities 返回了 null 或者没有我们可用的传输类型
                     Timber.w(
-                        "网络 onAvailable 触发于网络 $network，但 getNetworkCapabilities 未返回可用的传输类型，或者 currentActiveNetwork 为 null。" +
-                                " 将保持当前的网络状态判断 (${if (isNetworkConnected) "Connected" else "Disconnected"})。"
+                        "NetworkCallback.onAvailable: 网络 $network 变为可用，但 getNetworkCapabilities 未返回有效传输类型，或 currentActiveNetwork 为 null。isNetworkConnected 状态将保持为 $isNetworkConnected。"
                     )
-                    // 在这种情况下，最好保持谨慎，不轻易改变 isNetworkConnected 的状态，
-                    // 除非后续的 onLost 或 checkInitialNetworkState 明确指出了变化。
                 }
             }
 
-            /**
-             * 当一个满足 NetworkRequest 条件的网络连接丢失时调用。
-             *
-             * @param network 丢失的 Network 对象。
-             */
             override fun onLost(network: Network) {
                 super.onLost(network)
+                val callbackTime = System.currentTimeMillis()
+                val previousIsConnected = isNetworkConnected // 记录回调前的状态
+                Timber.d("NetworkCallback.onLost: 网络 $network 丢失 (回调时刻: $callbackTime)。之前的 isNetworkConnected = $previousIsConnected。")
 
-                // 当一个网络接口 (network) 丢失时，需要再次检查当前是否还有其他活动的、可用的网络连接。
-                // 因为 onLost 可能只针对特定的网络接口 (例如，从Wi-Fi切换到移动数据时，Wi-Fi会触发onLost，但移动数据会触发onAvailable)。
-                val activeNetworkCheck = connectivityManager.activeNetwork // 获取当前活动的网络
+                val activeNetworkCheck = connectivityManager.activeNetwork
+                var stillHasActiveGoodNetwork = false // 假设没有其他可用网络
 
-                if (activeNetworkCheck == null) {
-                    // 如果 activeNetworkCheck 为 null，表示确实没有活动的网络连接了。
-                    if (isNetworkConnected) { // 仅当之前是连接状态时才处理，避免重复处理或误判
-                        Timber.i("网络已断开 (onLost 触发于网络: $network，且无其他活动网络)。")
-                        isNetworkConnected = false // 标记全局网络状态为已断开
-                        downloadScope.launch { // 在 DownloadManager 的协程作用域中启动
-                            handleNetworkDisconnection() // 处理网络断开逻辑
-                        }
-                    }
-                } else {
-                    // 仍然存在一个活动的网络 (activeNetworkCheck)。
-                    Timber.d("网络接口 $network 已丢失，但另一个网络 $activeNetworkCheck 仍然活动。")
-
-                    // 检查这个仍然活动的网络是否具有我们需要的传输类型。
+                if (activeNetworkCheck != null) {
+                    Timber.d("NetworkCallback.onLost: 网络接口 $network 已丢失，但检测到另一个活动网络 $activeNetworkCheck。正在检查其能力...")
                     val capabilities = connectivityManager.getNetworkCapabilities(activeNetworkCheck)
                     if (capabilities != null && (
                                 capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
@@ -299,36 +271,42 @@ object DownloadManager {
                                         capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
                                 )
                     ) {
-                        // 如果仍然存在其他可用的、符合条件的网络连接，则全局网络状态仍然视为已连接。
-                        isNetworkConnected = true // 确保标记为已连接
-                        Timber.d("通过网络 $activeNetworkCheck，全局网络状态仍被认为是连接。")
+                        stillHasActiveGoodNetwork = true
+                        Timber.d("NetworkCallback.onLost: 活动网络 $activeNetworkCheck 具有有效传输类型。stillHasActiveGoodNetwork = true。")
                     } else {
-                        // 虽然存在一个活动的网络 (activeNetworkCheck)，但它可能不符合我们的传输类型要求
-                        // (例如，可能是一个 VPN 连接，但没有实际的互联网出口，或者是一个受限的网络)。
-                        Timber.w(
-                            "网络接口 $network 已丢失。活动的网络 $activeNetworkCheck 没有合适的传输类型。" +
-                                    " 假设全局网络已断开。"
-                        )
-                        if (isNetworkConnected) { // 仅当之前是连接状态时才处理
-                            isNetworkConnected = false // 标记全局网络状态为已断开
-                            downloadScope.launch {
-                                handleNetworkDisconnection() // 处理网络断开逻辑
-                            }
-                        }
+                        Timber.w("NetworkCallback.onLost: 活动网络 $activeNetworkCheck 没有合适的传输类型。stillHasActiveGoodNetwork = false。")
                     }
+                } else {
+                    Timber.d("NetworkCallback.onLost: 网络接口 $network 已丢失，且 activeNetworkCheck 为 null (无其他活动网络)。stillHasActiveGoodNetwork = false。")
+                }
+
+                if (!stillHasActiveGoodNetwork && previousIsConnected) { // 仅当之前是连接状态，并且现在确实没有任何可用网络时
+                    isNetworkConnected = false // 更新全局网络状态为已断开
+                    Timber.i("NetworkCallback.onLost: 网络从连接 -> 断开 (isNetworkConnected 从 $previousIsConnected -> false)。触发于网络 $network。准备调用 handleNetworkDisconnection。")
+                    downloadScope.launch {
+                        handleNetworkDisconnection()
+                    }
+                } else if (stillHasActiveGoodNetwork && !previousIsConnected) {
+                    // 特殊情况：之前是断开的，但这个 onLost 之后检查发现有其他好网络（可能 onAvailable 还没来得及更新 isNetworkConnected）
+                    isNetworkConnected = true
+                    Timber.i("NetworkCallback.onLost: (特殊情况) 网络 $network 丢失，但检测到其他可用网络 $activeNetworkCheck，且之前 isNetworkConnected 是 false。将其更新为 true。")
+                    // 考虑是否在这里也调用 handleNetworkReconnection，如果 isNetworkConnected 确实从 false 变为 true
+                    // if (!previousIsConnected) { downloadScope.launch { handleNetworkReconnection() } } // 这一句等同于 onAvailable 的逻辑
+                } else if (stillHasActiveGoodNetwork && previousIsConnected) {
+                    // 网络接口丢失，但仍有其他好网络，且之前也是连接状态。无需改变 isNetworkConnected。
+                    isNetworkConnected = true // 确保仍然是 true
+                    Timber.d("NetworkCallback.onLost: 网络 $network 丢失，但仍有其他可用网络 $activeNetworkCheck。isNetworkConnected 保持 true。")
+                }
+                else { // !stillHasActiveGoodNetwork && !previousIsConnected
+                    Timber.d("NetworkCallback.onLost: 网络 $network 丢失，之前已是断开状态 (isNetworkConnected = $previousIsConnected)。无需操作。")
                 }
             }
         }
 
         try {
-            // 尝试向 ConnectivityManager 注册网络回调
             connectivityManager.registerNetworkCallback(networkRequest, networkCallback)
         } catch (e: SecurityException) {
-            // 如果注册失败 (通常是因为缺少 ACCESS_NETWORK_STATE 权限)
             Timber.e(e, "注册网络回调失败。是否缺少 ACCESS_NETWORK_STATE 权限？")
-            // 在这种情况下，DownloadManager 将无法自动响应网络状态变化，
-            // 相关的自动恢复和暂停功能（基于网络状态）将无法工作。
-            // isNetworkConnected 的值将依赖于 checkInitialNetworkState 的初始检查结果，且不会动态更新。
         }
     }
 
@@ -390,21 +368,42 @@ object DownloadManager {
      */
     private suspend fun handleNetworkReconnection() {
         checkInitialized() // 确保 DownloadManager 已初始化
-        Timber.i("处理网络重新连接：正在恢复因网络暂停的任务...")
+        val callTimeMs = System.currentTimeMillis()
+        Timber.i("handleNetworkReconnection: 函数开始执行 (时刻: $callTimeMs)。当前全局 isNetworkConnected = $isNetworkConnected")
 
-        // 步骤 1: 获取所有因网络原因暂停的任务
-        // 首先获取所有任务，然后进行筛选：
-        // - it.isPausedByNetwork: 任务是因为网络问题而暂停的
-        // - it.status == DownloadStatus.PAUSED: 任务的当前状态确实是 PAUSED
+        if (!isNetworkConnected) {
+            Timber.w("handleNetworkReconnection: 进入函数时，全局 isNetworkConnected 标志为 false。可能网络状态变化极快。中止恢复流程。")
+            return
+        }
+
+        Timber.i("handleNetworkReconnection: 网络确认已连接。正在查找因网络问题暂停的任务...")
         val networkPausedTasks = downloadDao.getAllTasks().filter { it.isPausedByNetwork && it.status == DownloadStatus.PAUSED }
 
-        // 步骤 2: 遍历这些因网络原因暂停的任务，并尝试恢复它们
+        if (networkPausedTasks.isEmpty()) {
+            Timber.i("handleNetworkReconnection: 未发现因网络问题暂停的任务需要恢复。")
+            return
+        }
+
+        Timber.i("handleNetworkReconnection: 发现 ${networkPausedTasks.size} 个任务因网络暂停，将尝试恢复。")
+
         networkPausedTasks.forEach { task ->
-            Timber.i("网络已重新连接：尝试恢复任务 ${task.id} (${task.fileName})")
-            // 调用 resumeDownload 方法来处理具体的任务恢复逻辑。
-            // resumeDownload 通常会将任务状态设置为 PENDING 并加入下载队列。
+            val taskProcessStartTimeMs = System.currentTimeMillis()
+            Timber.i("handleNetworkReconnection: 准备处理任务 ${task.id} (${task.fileName})。DB状态: ${task.status}, isPausedByNetwork: ${task.isPausedByNetwork} (开始处理时刻: $taskProcessStartTimeMs)")
+
+            // 考虑到 resumeDownload 内部已有网络检查，这里的检查可以作为第一道防线。
+            // 如果网络在此时已经断开，可以避免调用 resumeDownload，减少不必要的数据库查询和日志。
+            if (!isNetworkConnected) {
+                Timber.w("handleNetworkReconnection: (前置检查) 在尝试恢复任务 ${task.id} 时，检测到网络连接已断开 (当前时刻: ${System.currentTimeMillis()})。将跳过对此任务调用 resumeDownload。")
+                // resumeDownload 内部的逻辑会处理这种情况，如果被调用的话。
+                // 但如果这里已经知道网络断了，直接跳过可以更高效。
+                return@forEach // 跳到下一个任务
+            }
+
+            Timber.i("handleNetworkReconnection: 网络似乎仍然连接 (任务 ${task.id})。调用 resumeDownload(${task.id})。")
+            // resumeDownload 内部会再次检查网络，并处理状态更新和任务入队。
             resumeDownload(task.id)
         }
+        Timber.i("handleNetworkReconnection: 函数执行完毕。(总耗时: ${System.currentTimeMillis() - callTimeMs}ms)")
     }
 
     private fun resumeInterruptedTasksOnStart() {
@@ -1149,12 +1148,25 @@ object DownloadManager {
             }
 
             val request = requestBuilder.build()
-            Timber.d("任务 ${currentTask.id}: 正在执行 HTTP 请求到 ${request.url}")
+            Timber.d("任务 ${currentTask.id}: 构建的请求头:")
+            request.headers.forEach { header ->
+                Timber.d("任务 ${currentTask.id}: ReqHeader: ${header.first}=${header.second}")
+            }
+            Timber.d("任务 ${currentTask.id}: 正在执行 HTTP 请求到 ${request.url}，期望恢复从: ${initialDownloadedBytesForSession}, ETag: ${currentTask.eTag}, LastModified: ${currentTask.lastModified}")
+
             response = okHttpClient.newCall(request).execute()
-            Timber.d("任务 ${currentTask.id}: 收到响应，状态码: ${response.code}")
+            Timber.d("任务 ${currentTask.id}: 收到的响应头:")
+            response.headers.forEach { header ->
+                Timber.d("任务 ${currentTask.id}: ResHeader: ${header.first}=${header.second}")
+            }
+            // 特别关注服务器返回的 ETag, Last-Modified, Content-Range, Accept-Ranges
+            Timber.d("任务 ${currentTask.id}: ResHeader 'ETag': ${response.header("ETag")}")
+            Timber.d("任务 ${currentTask.id}: ResHeader 'Last-Modified': ${response.header("Last-Modified")}")
+            Timber.d("任务 ${currentTask.id}: ResHeader 'Content-Range': ${response.header("Content-Range")}")
+            Timber.d("任务 ${currentTask.id}: ResHeader 'Accept-Ranges': ${response.header("Accept-Ranges")}")
 
             // 在处理响应前，再次检查任务状态和协程状态
-            var taskStateBeforeWrite = downloadDao.getTaskById(currentTask.id)
+            val taskStateBeforeWrite = downloadDao.getTaskById(currentTask.id)
             if (!currentCoroutineContext().isActive || taskStateBeforeWrite == null || taskStateBeforeWrite.status != DownloadStatus.DOWNLOADING) {
                 Timber.w("任务 ${currentTask.id} 在网络响应后被取消或状态已更改 (DB状态: ${taskStateBeforeWrite?.status} / Coroutine: ${currentCoroutineContext().isActive})。中止写入。")
                 response.close()
@@ -1203,7 +1215,7 @@ object DownloadManager {
             val newLastModified = response.header("Last-Modified")
 
             if (response.code == 200) { // HTTP 200 OK (完整内容)
-                Timber.i("任务 ${currentTask.id}: 收到 HTTP 200 OK。将从头开始下载。")
+                Timber.i("任务 ${currentTask.id}: 收到 HTTP 200 OK。initialDownloadedBytesForSession Was: $initialDownloadedBytesForSession. 将从头开始下载。") // 添加 initialDownloadedBytesForSession 日志
                 if (initialDownloadedBytesForSession > 0) {
                     Timber.w("任务 ${currentTask.id}: 收到 HTTP 200，但之前有进度 ($initialDownloadedBytesForSession bytes)。重置数据库进度为 0。")
                     downloadDao.updateDownloadedBytes(currentTask.id, 0L)
@@ -1272,7 +1284,7 @@ object DownloadManager {
             responseBody.byteStream().use { inputStream ->
                 while (true) {
                     if (!currentCoroutineContext().isActive) {
-                        Timber.i("任务 ${currentTask.id} 在读取循环中检测到协程非活动。")
+                        Timber.i("任务 ${currentTask.id} 在读取循环中检测到协程非 。")
                         break // 由 finally 处理进度保存和状态
                     }
 
@@ -1337,7 +1349,7 @@ object DownloadManager {
                     // 交给外层 CancellationException 处理，或者如果到这里还没抛，则手动处理
                     updateTaskStatus(currentTask.id, DownloadStatus.PAUSED, isNetworkPaused = currentTask.isPausedByNetwork, error = CancellationException("下载在完成检查前被取消"))
                 }
-                return;
+                return
             }
 
             if (currentTask.status == DownloadStatus.DOWNLOADING) {
@@ -1379,12 +1391,63 @@ object DownloadManager {
             // isNetworkIssue false, 因为是外部/用户取消，除非特定情况
             handleCancellationOrError(currentTask.id, DownloadStatus.PAUSED, e, false)
         } catch (e: IOException) {
-            Timber.e(e, "任务 ${currentTask.id} 下载期间发生 IOException: ${e.message}")
+            Timber.e(e, "任务 ${currentTask.id} 下载期间发生 IOException。原始消息: '${e.message}'") // 打印原始异常消息
             val currentDownloadedBeforeError = currentTask.downloadedBytes + bytesActuallyWrittenThisSession
             downloadDao.updateDownloadedBytes(currentTask.id, currentDownloadedBeforeError)
 
-            // isNetworkIssue 可以根据 isNetworkConnected 判断
-            handleCancellationOrError(currentTask.id, DownloadStatus.FAILED, e, !isNetworkConnected)
+            // --- 开始详细诊断 isLikelySuddenNetworkLoss ---
+            val exceptionIsSocketException = e is java.net.SocketException
+            val messageContent = e.message ?: "null" // 获取消息内容，如果是null则为"null"字符串
+            Timber.d("任务 ${currentTask.id}: IOException诊断: e is SocketException = $exceptionIsSocketException")
+            Timber.d("任务 ${currentTask.id}: IOException诊断: e.message = '$messageContent'")
+
+            val matchesSoftwareCausedAbort = messageContent.contains("Software caused connection abort", ignoreCase = true)
+            val matchesConnectionReset = messageContent.contains("Connection reset", ignoreCase = true)
+            val matchesNetworkUnreachable = messageContent.contains("Network is unreachable", ignoreCase = true) ||
+                    messageContent.contains("ENETUNREACH", ignoreCase = true)
+            val matchesHostUnreachable = messageContent.contains("EHOSTUNREACH", ignoreCase = true)
+
+            Timber.d("任务 ${currentTask.id}: IOException诊断: matchesSoftwareCausedAbort = $matchesSoftwareCausedAbort")
+            Timber.d("任务 ${currentTask.id}: IOException诊断: matchesConnectionReset = $matchesConnectionReset")
+            Timber.d("任务 ${currentTask.id}: IOException诊断: matchesNetworkUnreachable = $matchesNetworkUnreachable")
+            Timber.d("任务 ${currentTask.id}: IOException诊断: matchesHostUnreachable = $matchesHostUnreachable")
+
+            val isSocketExceptionWithMatchingMessage = exceptionIsSocketException &&
+                    (matchesSoftwareCausedAbort || matchesConnectionReset || matchesNetworkUnreachable || matchesHostUnreachable)
+            Timber.d("任务 ${currentTask.id}: IOException诊断: isSocketExceptionWithMatchingMessage = $isSocketExceptionWithMatchingMessage")
+
+            val exceptionIsUnknownHost = e is java.net.UnknownHostException
+            val exceptionIsConnectException = e is java.net.ConnectException
+            Timber.d("任务 ${currentTask.id}: IOException诊断: e is UnknownHostException = $exceptionIsUnknownHost")
+            Timber.d("任务 ${currentTask.id}: IOException诊断: e is ConnectException = $exceptionIsConnectException")
+
+            val isLikelySuddenNetworkLoss = isSocketExceptionWithMatchingMessage || exceptionIsUnknownHost || exceptionIsConnectException
+            Timber.d("任务 ${currentTask.id}: IOException诊断: 最终 isLikelySuddenNetworkLoss = $isLikelySuddenNetworkLoss")
+            // --- 结束详细诊断 isLikelySuddenNetworkLoss ---
+
+            val newStatus: DownloadStatus
+            val isConsideredNetworkIssueForThisError: Boolean
+
+            if (isLikelySuddenNetworkLoss) {
+                newStatus = DownloadStatus.PAUSED
+                isConsideredNetworkIssueForThisError = true
+                Timber.i("任务 ${currentTask.id}: IOException (${e.javaClass.simpleName}: '${e.message}') 被识别为可能的网络突断。设置状态为 PAUSED，标记为网络问题。")
+            } else {
+                // 如果不是预定义的网络突断异常，则依赖全局 isNetworkConnected 状态
+                val currentGlobalNetworkConnectedState = isNetworkConnected // 捕获当前全局状态以供日志记录
+                Timber.d("任务 ${currentTask.id}: IOException (${e.javaClass.simpleName}: '${e.message}') 未被识别为典型的网络突断。将依赖全局 isNetworkConnected 状态 (当前值: $currentGlobalNetworkConnectedState)。")
+                if (!currentGlobalNetworkConnectedState) { // 使用捕获的全局状态
+                    newStatus = DownloadStatus.PAUSED
+                    isConsideredNetworkIssueForThisError = true
+                    Timber.i("任务 ${currentTask.id}: 全局网络状态为断开。设置状态为 PAUSED，标记为网络问题。")
+                } else {
+                    newStatus = DownloadStatus.FAILED
+                    isConsideredNetworkIssueForThisError = false
+                    Timber.w("任务 ${currentTask.id}: 全局网络状态为连接。设置状态为 FAILED，标记为非网络问题。")
+                }
+            }
+            Timber.d("任务 ${currentTask.id}: IOException 处理决策: newStatus=$newStatus, isConsideredNetworkIssueForThisError=$isConsideredNetworkIssueForThisError (基于 isLikelySuddenNetworkLoss=$isLikelySuddenNetworkLoss 和当时的全局 isNetworkConnected=$isNetworkConnected)")
+            handleCancellationOrError(currentTask.id, newStatus, e, isConsideredNetworkIssueForThisError)
         } catch (e: Exception) {
             Timber.e(e, "任务 ${currentTask.id} 下载期间发生意外错误: ${e.message}")
             val currentDownloadedBeforeError = currentTask.downloadedBytes + bytesActuallyWrittenThisSession
