@@ -1275,11 +1275,11 @@ object DownloadManager {
             Timber.d("任务 ${currentTask.id}: RandomAccessFile seek to ${currentTask.downloadedBytes}")
 
             // --- 读取响应体并写入文件 ---
-            val buffer = ByteArray(64 * 1024) // 64KB buffer
+            val buffer = ByteArray(512 * 1024) // 512KB buffer
             var bytesReadFromStream: Int
             var lastUiEmitTime = System.currentTimeMillis()
             var bytesSinceLastDbUpdate: Long = 0
-            val dbUpdateThresholdBytes: Long = 512 * 1024 // 每 512KB 更新一次数据库
+            val dbUpdateThresholdBytes: Long = 512 * 1024 * 1024 // 每 512KB 更新一次数据库
 
             responseBody.byteStream().use { inputStream ->
                 while (true) {
@@ -1289,7 +1289,7 @@ object DownloadManager {
                     }
 
                     // 检查数据库状态以响应外部暂停/取消
-                    if (System.currentTimeMillis() - lastUiEmitTime > 500) { // 可调整检查频率
+                    if (System.currentTimeMillis() - lastUiEmitTime > 1000) { // 可调整检查频率
                         val taskStateInLoop = downloadDao.getTaskById(currentTask.id)
                         if (taskStateInLoop == null || taskStateInLoop.status != DownloadStatus.DOWNLOADING) {
                             Timber.w("任务 ${currentTask.id} 在下载过程中数据库状态变为 ${taskStateInLoop?.status}。中止写入循环。")
