@@ -37,5 +37,6 @@ data class DownloadProgress(
     val downloadedBytes: Long,
     val totalBytes: Long,
     val status: DownloadStatus,
-    val error: Throwable? = null // 可选的错误信息
+    val error: Throwable? = null, // 可选的错误信息
+    val fileName: String? = null
 )

@@ -8,17 +8,22 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.ProgressIndicatorDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -32,6 +37,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import cn.cqautotest.downloader.downloader.DownloadStatus
+import cn.cqautotest.downloader.downloader.DownloadTaskUiState
 import cn.cqautotest.downloader.downloader.DownloadUiState
 import cn.cqautotest.downloader.downloader.DownloadViewModel
 import cn.cqautotest.downloader.downloader.DownloadViewModelFactory
@@ -54,15 +60,16 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent {
             DownloaderTheme {
-                Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    val uiState by downloadViewModel.uiState.collectAsState()
+                val uiState by downloadViewModel.uiState.collectAsState()
 
+                Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     DownloadScreen(
                         modifier = Modifier.padding(innerPadding),
                         uiState = uiState,
-                        onDownloadAction = { url -> downloadViewModel.handleDownloadAction(url) },
-                        onCancelAction = { downloadViewModel.cancelCurrentDownload() },
-                        onDownloadLog = { Timber.d("MainActivityDownloadLog: $it") }
+                        onStartDownloads = { urls -> downloadViewModel.handleDownloadAction(urls) },
+                        onCancelTask = { taskId -> downloadViewModel.cancelTask(taskId) },
+                        onPauseTask = { taskId -> downloadViewModel.pauseTask(taskId) },
+                        onResumeTask = { taskId -> downloadViewModel.resumeTask(taskId) }
                     )
                 }
             }
@@ -74,158 +81,97 @@ class MainActivity : ComponentActivity() {
 fun DownloadScreen(
     modifier: Modifier = Modifier,
     uiState: DownloadUiState,
-    onDownloadAction: (String) -> Unit,
-    onCancelAction: () -> Unit,
-    onDownloadLog: (String) -> Unit = {}
+    onStartDownloads: (List<String>) -> Unit,
+    onCancelTask: (String) -> Unit,
+    onPauseTask: (String) -> Unit,
+    onResumeTask: (String) -> Unit
 ) {
-    // 输入框状态
     val urlInput = remember { mutableStateOf("") }
 
     Column(
         modifier = modifier
             .fillMaxSize()
-            .padding(16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
+            .padding(16.dp)
     ) {
-
-        /* ===== 1. 输入框 ===== */
         OutlinedTextField(
             value = urlInput.value,
             onValueChange = { urlInput.value = it },
-            label = { Text("下载链接") },
-            singleLine = true,
+            label = { Text("输入多个下载链接（每行一个）") },
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-            modifier = Modifier.fillMaxWidth()
+            modifier = Modifier.fillMaxWidth(),
+            maxLines = 5
         )
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Button(
+            onClick = {
+                val urls = urlInput.value.lines().filter { it.isNotBlank() }
+                if (urls.isNotEmpty()) onStartDownloads(urls)
+            },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("开始批量下载")
+        }
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        /* ===== 2. 下载/暂停/恢复按钮 ===== */
-        Button(
-            onClick = {
-                onDownloadLog("Download action with URL: ${urlInput.value}")
-                onDownloadAction(urlInput.value.trim())
-            },
-            enabled = urlInput.value.isNotBlank()
-        ) {
-            Text(
-                text = when {
-                    uiState.status == DownloadStatus.DOWNLOADING -> "暂停"
-                    uiState.status == DownloadStatus.PAUSED -> "恢复"
-                    uiState.currentTaskId != null &&
-                            (uiState.status == DownloadStatus.COMPLETED ||
-                                    uiState.status == DownloadStatus.FAILED ||
-                                    uiState.status == DownloadStatus.CANCELLED) -> "重新下载"
-
-                    else -> "下载"
-                }
-            )
-        }
-
-        /* ===== 3. 进度条 ===== */
-        if (uiState.isActionInProgress ||
-            (uiState.currentTaskId != null &&
-                    (uiState.status == DownloadStatus.COMPLETED ||
-                            uiState.status == DownloadStatus.FAILED))
-        ) {
-            Spacer(modifier = Modifier.height(16.dp))
-            LinearProgressIndicator(
-                progress = { uiState.progressPercent },
-                modifier = Modifier.fillMaxWidth()
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(
-                text = "已下载: ${uiState.downloadedBytesFormatted} / ${uiState.totalBytesFormatted}"
-            )
-        }
-
-        /* ===== 4. 状态文字 ===== */
-        Spacer(modifier = Modifier.height(8.dp))
-        Text(text = uiState.statusText)
-
-        /* ===== 5. 错误提示 ===== */
-        if (uiState.errorMessage != null) {
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(
-                text = "错误: ${uiState.errorMessage}",
-                color = MaterialTheme.colorScheme.error
-            )
-        }
-
-        /* ===== 6. 取消按钮 ===== */
-        if (uiState.isActionInProgress && uiState.status != DownloadStatus.COMPLETED) {
-            Spacer(modifier = Modifier.height(16.dp))
-            Button(
-                onClick = {
-                    onDownloadLog("Cancel clicked")
-                    onCancelAction()
-                },
-                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
-            ) {
-                Text("取消下载")
+        LazyColumn {
+            items(uiState.tasks) { task ->
+                DownloadTaskItem(
+                    task = task,
+                    onPause = { onPauseTask(task.taskId) },
+                    onResume = { onResumeTask(task.taskId) },
+                    onCancel = { onCancelTask(task.taskId) }
+                )
             }
         }
     }
 }
 
-@Preview(showBackground = true)
 @Composable
-fun DownloadScreenPreview() {
-    DownloaderTheme {
-        val previewState = DownloadUiState(
-            progressPercent = 0.6f,
-            downloadedBytesFormatted = "600 KB",
-            totalBytesFormatted = "1.00 MB",
-            status = DownloadStatus.DOWNLOADING,
-            statusText = "下载中: 60.0%",
-            isActionInProgress = true
-        )
-        DownloadScreen(
-            uiState = previewState,
-            onDownloadAction = {},
-            onCancelAction = {},
-            onDownloadLog = { message -> Timber.d("PreviewLog: $message") } // Example for preview
-        )
-    }
-}
+fun DownloadTaskItem(
+    task: DownloadTaskUiState,
+    onPause: () -> Unit,
+    onResume: () -> Unit,
+    onCancel: () -> Unit
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp)
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Text(task.fileName, style = MaterialTheme.typography.bodyLarge)
+            LinearProgressIndicator(
+                progress = { task.progressPercent },
+                color = ProgressIndicatorDefaults.linearColor,
+                trackColor = ProgressIndicatorDefaults.linearTrackColor,
+                strokeCap = ProgressIndicatorDefaults.LinearStrokeCap,
+            )
+            Text("${task.downloadedBytesFormatted} / ${task.totalBytesFormatted}", style = MaterialTheme.typography.bodySmall)
+            Text(task.statusText, style = MaterialTheme.typography.bodyMedium)
 
-@Preview(showBackground = true, name = "Download Completed Preview")
-@Composable
-fun DownloadScreenCompletedPreview() {
-    DownloaderTheme {
-        val previewState = DownloadUiState(
-            progressPercent = 1.0f,
-            downloadedBytesFormatted = "1.00 MB",
-            totalBytesFormatted = "1.00 MB",
-            status = DownloadStatus.COMPLETED,
-            statusText = "下载完成!",
-            isActionInProgress = false
-        )
-        DownloadScreen(
-            uiState = previewState,
-            onDownloadAction = {},
-            onCancelAction = {},
-            onDownloadLog = { message -> Timber.d("PreviewLog: $message") }
-        )
-    }
-}
+            task.errorMessage?.let {
+                Text(it, color = MaterialTheme.colorScheme.error)
+            }
 
-@Preview(showBackground = true, name = "Download Error Preview")
-@Composable
-fun DownloadScreenErrorPreview() {
-    DownloaderTheme {
-        val previewState = DownloadUiState(
-            status = DownloadStatus.FAILED,
-            statusText = "下载失败: 网络连接超时",
-            isActionInProgress = false,
-            errorMessage = "网络连接超时"
-        )
-        DownloadScreen(
-            uiState = previewState,
-            onDownloadAction = {},
-            onCancelAction = {},
-            onDownloadLog = { message -> Timber.d("PreviewLog: $message") }
-        )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                when (task.status) {
+                    DownloadStatus.DOWNLOADING -> Button(onClick = onPause) { Text("暂停") }
+                    DownloadStatus.PAUSED -> Button(onClick = onResume) { Text("恢复") }
+                    else -> {}
+                }
+
+                if (task.status != DownloadStatus.COMPLETED && task.status != DownloadStatus.CANCELLED) {
+                    Button(
+                        onClick = onCancel,
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                    ) {
+                        Text("取消")
+                    }
+                }
+            }
+        }
     }
 }

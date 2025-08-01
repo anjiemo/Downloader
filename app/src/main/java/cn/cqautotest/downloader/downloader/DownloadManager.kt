@@ -815,7 +815,8 @@ object DownloadManager {
             _downloadProgressFlow.tryEmit(
                 DownloadProgress(
                     initialTaskStateFromQueue.id, 0L, 0L, DownloadStatus.FAILED,
-                    IOException("任务记录在启动时丢失")
+                    IOException("任务记录在启动时丢失"),
+                    fileName = ""
                 )
             )
             activeDownloads.remove(initialTaskStateFromQueue.id) // 清理 activeDownloads
@@ -831,7 +832,8 @@ object DownloadManager {
                 _downloadProgressFlow.tryEmit(
                     DownloadProgress(
                         currentTask.id, currentTask.downloadedBytes, currentTask.totalBytes,
-                        currentTask.status, currentTask.errorDetails?.let { IOException(it) }
+                        currentTask.status, currentTask.errorDetails?.let { IOException(it) },
+                        fileName = File(currentTask.filePath).name
                     )
                 )
             } else if (currentTask.status != DownloadStatus.COMPLETED) {
@@ -1055,7 +1057,15 @@ object DownloadManager {
 
                     val currentTime = System.currentTimeMillis()
                     if (currentTime - lastUiEmitTime >= 1000) { // 每秒发射一次UI进度
-                        _downloadProgressFlow.tryEmit(DownloadProgress(currentTask.id, currentTotalDownloadedInMemory, currentTask.totalBytes, DownloadStatus.DOWNLOADING))
+                        _downloadProgressFlow.tryEmit(
+                            DownloadProgress(
+                                currentTask.id,
+                                currentTotalDownloadedInMemory,
+                                currentTask.totalBytes,
+                                DownloadStatus.DOWNLOADING,
+                                fileName = file.name
+                            )
+                        )
                         lastUiEmitTime = currentTime
                     }
                 }
@@ -1072,10 +1082,12 @@ object DownloadManager {
                 expected == null -> {
                     Timber.d("任务 ${currentTask.id} 无需校验 MD5")
                 }
+
                 !actualMd5.equals(expected, ignoreCase = true) -> {
                     updateTaskStatus(currentTask.id, DownloadStatus.FAILED, error = IOException("MD5 校验失败"))
                     return
                 }
+
                 actualMd5.equals(expected, ignoreCase = true) -> {
                     Timber.d("任务 ${currentTask.id} MD5校验成功")
                 }
@@ -1123,7 +1135,8 @@ object DownloadManager {
                 _downloadProgressFlow.tryEmit(
                     DownloadProgress(
                         currentTask.id, currentTask.downloadedBytes, currentTask.totalBytes,
-                        currentTask.status, currentTask.errorDetails?.let { IOException(it) }
+                        currentTask.status, currentTask.errorDetails?.let { IOException(it) },
+                        fileName = file.name
                     )
                 )
             }
