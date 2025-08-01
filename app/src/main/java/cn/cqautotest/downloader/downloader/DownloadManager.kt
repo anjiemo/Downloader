@@ -6,8 +6,9 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.Uri
+import android.util.Base64
 import android.webkit.MimeTypeMap
-import cn.cqautotest.downloader.util.StreamingMd5
+
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -36,6 +37,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.cancellation.CancellationException
 import androidx.core.net.toUri
+import okio.`-DeprecatedOkio`.buffer
 
 object DownloadManager {
 
@@ -1080,17 +1082,24 @@ object DownloadManager {
             }
 
             randomAccessFile = RandomAccessFile(file, "rw")
-            // currentTask.downloadedBytes 此时是准确的写入起始点 (0 或之前的进度)
+            val fileLength = randomAccessFile.length()
+            
+            // 验证文件长度与已下载字节数是否匹配
+            if (fileLength != currentTask.downloadedBytes) {
+                Timber.w("任务 ${currentTask.id}: 文件长度不匹配，重新开始下载")
+                randomAccessFile.setLength(0)
+                downloadDao.updateDownloadedBytes(currentTask.id, 0L)
+                currentTask = currentTask.copy(downloadedBytes = 0L)
+            }
+            
             randomAccessFile.seek(currentTask.downloadedBytes)
-            Timber.d("任务 ${currentTask.id}: RandomAccessFile seek to ${currentTask.downloadedBytes}")
-
-            // --- 读取响应体并写入文件 ---
-            val buffer = ByteArray(512 * 1024) // 512KB buffer
+            
+            // 移除流式MD5计算，改用完整文件校验
+            var bytesSinceLastDbUpdate: Long = 0
+            val dbUpdateThresholdBytes: Long = 512 * 1024 // 512KB
             var bytesReadFromStream: Int
             var lastUiEmitTime = System.currentTimeMillis()
-            var bytesSinceLastDbUpdate: Long = 0
-            val dbUpdateThresholdBytes: Long = 512 * 1024 * 1024 // 每 512KB 更新一次数据库
-            val streamingMd5 = StreamingMd5()
+            val buffer = ByteArray(8192)
 
             responseBody.byteStream().use { inputStream ->
                 while (true) {
@@ -1117,20 +1126,19 @@ object DownloadManager {
                     randomAccessFile.write(buffer, 0, bytesReadFromStream)
                     bytesActuallyWrittenThisSession += bytesReadFromStream
                     bytesSinceLastDbUpdate += bytesReadFromStream
-                    streamingMd5.update(buffer, 0, bytesReadFromStream)
 
-                    // currentTask.downloadedBytes 是会话开始时的值
-                    // 最新总下载进度 = 会话开始时的进度 + 本会话已写入的字节
-                    val currentTotalDownloadedInMemory = currentTask.downloadedBytes + bytesActuallyWrittenThisSession
-
+                    // 更新数据库进度
                     if (bytesSinceLastDbUpdate >= dbUpdateThresholdBytes) {
+                        val currentTotalDownloadedInMemory = currentTask.downloadedBytes + bytesActuallyWrittenThisSession
                         downloadDao.updateDownloadedBytes(currentTask.id, currentTotalDownloadedInMemory)
                         bytesSinceLastDbUpdate = 0
                         Timber.v("任务 ${currentTask.id} DB进度更新: $currentTotalDownloadedInMemory/${currentTask.totalBytes}")
                     }
 
+                    // 更新UI进度
                     val currentTime = System.currentTimeMillis()
-                    if (currentTime - lastUiEmitTime >= 1000) { // 每秒发射一次UI进度
+                    if (currentTime - lastUiEmitTime >= 1000) {
+                        val currentTotalDownloadedInMemory = currentTask.downloadedBytes + bytesActuallyWrittenThisSession
                         _downloadProgressFlow.tryEmit(
                             DownloadProgress(
                                 currentTask.id,
@@ -1144,26 +1152,29 @@ object DownloadManager {
                     }
                 }
             }
-            // --- 下载循环结束后 (EOF 或 break) ---
+
+            // 下载完成后计算整个文件的MD5
             val finalTotalDownloadedBytes = currentTask.downloadedBytes + bytesActuallyWrittenThisSession
-            downloadDao.updateDownloadedBytes(currentTask.id, finalTotalDownloadedBytes) // 关键：保存最终精确进度
-            Timber.d("任务 ${currentTask.id}: 循环结束后，最终DB进度更新为: $finalTotalDownloadedBytes")
+            downloadDao.updateDownloadedBytes(currentTask.id, finalTotalDownloadedBytes)
 
-            val actualMd5 = streamingMd5.digestBase64()
-            val expected = currentTask.md5Expected ?: currentTask.md5FromServer
-            Timber.d("任务 ${currentTask.id} actualMd5 is ${actualMd5} expected is $expected md5Expected is ${currentTask.md5Expected} md5FromServer is ${currentTask.md5FromServer}")
-            when {
-                expected == null -> {
-                    Timber.d("任务 ${currentTask.id} 无需校验 MD5")
-                }
-
-                !actualMd5.equals(expected, ignoreCase = true) -> {
-                    updateTaskStatus(currentTask.id, DownloadStatus.FAILED, error = IOException("MD5 校验失败"))
-                    return
-                }
-
-                actualMd5.equals(expected, ignoreCase = true) -> {
-                    Timber.d("任务 ${currentTask.id} MD5校验成功")
+            if (file.exists()) {
+                val actualMd5 = calculateFileMd5(file)
+                val expected = currentTask.md5Expected ?: currentTask.md5FromServer
+                
+                when {
+                    expected == null -> {
+                        Timber.d("任务 ${currentTask.id} 无需校验 MD5")
+                        updateTaskStatus(currentTask.id, DownloadStatus.COMPLETED)
+                    }
+                    !actualMd5.equals(expected, ignoreCase = true) -> {
+                        Timber.e("任务 ${currentTask.id} MD5校验失败：期望值=$expected, 实际值=$actualMd5")
+                        updateTaskStatus(currentTask.id, DownloadStatus.FAILED, error = IOException("MD5 校验失败"))
+                        return
+                    }
+                    else -> {
+                        Timber.d("任务 ${currentTask.id} MD5校验成功")
+                        updateTaskStatus(currentTask.id, DownloadStatus.COMPLETED)
+                    }
                 }
             }
 
@@ -1399,6 +1410,18 @@ object DownloadManager {
 
         // 如果所有自动推断都失败，使用外部传入的文件名
         return customFileName ?: "download.bin"
+    }
+
+    private fun calculateFileMd5(file: File): String {
+        return file.inputStream().use { fis ->
+            val buffer = ByteArray(8192)
+            val md = java.security.MessageDigest.getInstance("MD5")
+            var bytesRead: Int
+            while (fis.read(buffer).also { bytesRead = it } != -1) {
+                md.update(buffer, 0, bytesRead)
+            }
+            Base64.encodeToString(md.digest(), android.util.Base64.NO_WRAP)
+        }
     }
 
     suspend fun testRawOkHttpSpeed(url: String, client: OkHttpClient) {
