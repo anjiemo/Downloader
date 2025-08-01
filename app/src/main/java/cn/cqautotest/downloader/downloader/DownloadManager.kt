@@ -496,7 +496,7 @@ object DownloadManager {
         var existingTask = downloadDao.getTaskByFilePath(filePath) // 根据文件路径查找现有任务
 
         if (existingTask != null) {
-            Timber.i("文件 '$fileName' 在 '$dirPath' 的任务已存在，ID 为 ${existingTask.id}，状态为: ${existingTask.status}。")
+            Timber.i("文件 '$actualFileName' 在 '$dirPath' 的任务已存在，ID 为 ${existingTask.id}，状态为: ${existingTask.status}。")
             when (existingTask.status) {
                 DownloadStatus.COMPLETED -> {
                     Timber.i("任务 ${existingTask.id} 已完成。发出进度并返回现有 ID。")
@@ -549,8 +549,8 @@ object DownloadManager {
             }
         } else {
             // 没有找到现有任务，创建一个新的下载任务
-            Timber.i("文件 '$fileName' 在 '$dirPath' 不存在现有任务。正在创建新任务。")
-            existingTask = DownloadTask(url = url, filePath = filePath, fileName = fileName, md5Expected = md5Expected)
+            Timber.i("文件 '$actualFileName' 在 '$dirPath' 不存在现有任务。正在创建新任务。")
+            existingTask = DownloadTask(url = url, filePath = filePath, fileName = actualFileName, md5Expected = md5Expected)
             downloadDao.insertOrUpdateTask(existingTask) // 将新任务插入数据库
         }
 
@@ -566,7 +566,7 @@ object DownloadManager {
                 taskToProcess.downloadedBytes,
                 taskToProcess.totalBytes,
                 taskToProcess.status,
-                fileName = fileName
+                fileName = actualFileName
             )
         )
 
@@ -1279,41 +1279,6 @@ object DownloadManager {
         }
     }
 
-    private fun resolveFileName(url: String, responseHeaders: Map<String, String>, customFileName: String?, useCustomFileName: Boolean): String {
-        if (useCustomFileName && !customFileName.isNullOrBlank()) return customFileName
-        val uri = try {
-            url.trim().toUri()
-        } catch (e: Exception) {
-            Timber.w(e,"非法 URI 格式: $url")
-            null
-        }
-
-        val disposition = responseHeaders["Content-Disposition"].orEmpty()
-        val dispositionName = disposition
-            .substringAfter("filename=")
-            .removeSurrounding("\"")
-            .substringBefore(';')
-            .takeIf { it.isNotBlank() }
-
-        val uriFileName = uri?.lastPathSegment?.takeIf { it.isNotBlank() }
-        val mimeType = responseHeaders["Content-Type"]?.lowercase()?.substringBefore(';')?.trim()
-        val inferredExt = mimeType?.let {
-            MimeTypeMap.getSingleton().getExtensionFromMimeType(it)?.let { ext -> ".$ext" }
-        }
-
-        val baseName = dispositionName ?: uriFileName ?: "download"
-        val nameWithoutExt = baseName.substringBeforeLast('.')
-        val existingExt = baseName.substringAfterLast('.', "")
-
-        val finalExt = when {
-            existingExt.isNotBlank() -> ".$existingExt"
-            inferredExt != null -> inferredExt
-            else -> ".bin"
-        }
-
-        return "$nameWithoutExt$finalExt"
-    }
-
     private suspend fun handleCancellationOrError(
         taskId: String,
         statusToSet: DownloadStatus,
@@ -1353,6 +1318,59 @@ object DownloadManager {
             // 任务不存在，但仍尝试发出一个表示失败的进度事件
             _downloadProgressFlow.tryEmit(DownloadProgress(taskId, 0, 0, statusToSet, error))
         }
+    }
+
+    private fun resolveFileName(
+        url: String,
+        responseHeaders: Map<String, String>,
+        customFileName: String?,
+        useCustomFileName: Boolean
+    ): String {
+        // 如果明确使用自定义文件名，则直接返回自定义文件名
+        if (useCustomFileName) {
+            return customFileName ?: "download"
+        }
+
+        // 尝试从 Content-Disposition 提取文件名
+        val disposition = responseHeaders["Content-Disposition"].orEmpty()
+        val dispositionName = disposition
+            .substringAfter("filename=", "")
+            .removeSurrounding("\"")
+            .substringBefore(';')
+            .takeIf { it.isNotBlank() }
+
+        // 尝试从 URL 提取文件名
+        val uri = try {
+            url.trim().toUri()
+        } catch (e: Exception) {
+            Timber.w(e, "非法 URI 格式: $url")
+            null
+        }
+        val uriFileName = uri?.lastPathSegment?.takeIf { it.isNotBlank() }
+
+        // 尝试从 MIME 类型推断扩展名
+        val mimeType = responseHeaders["Content-Type"]?.lowercase()?.substringBefore(';')?.trim()
+        val inferredExt = mimeType?.let {
+            MimeTypeMap.getSingleton().getExtensionFromMimeType(it)?.let { ext -> ".$ext" }
+        }
+
+        // 如果 Content-Disposition 提取成功，直接使用
+        if (dispositionName != null) {
+            return dispositionName
+        }
+
+        // 如果 URI 提取成功，直接使用
+        if (uriFileName != null) {
+            return uriFileName
+        }
+
+        // 如果 MIME 类型推断成功，尝试使用
+        if (inferredExt != null) {
+            return "download$inferredExt"
+        }
+
+        // 如果所有自动推断都失败，使用外部传入的文件名
+        return customFileName ?: "download.bin"
     }
 
     suspend fun testRawOkHttpSpeed(url: String, client: OkHttpClient) {
