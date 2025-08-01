@@ -5,6 +5,7 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import cn.cqautotest.downloader.util.StreamingMd5
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -478,7 +479,7 @@ object DownloadManager {
         }
     }
 
-    suspend fun enqueueNewDownload(url: String, dirPath: String, fileName: String): String {
+    suspend fun enqueueNewDownload(url: String, dirPath: String, fileName: String, md5Expected: String? = null): String {
         checkInitialized()
         val directory = File(dirPath)
         if (!directory.exists()) {
@@ -543,7 +544,7 @@ object DownloadManager {
         } else {
             // 没有找到现有任务，创建一个新的下载任务
             Timber.i("文件 '$fileName' 在 '$dirPath' 不存在现有任务。正在创建新任务。")
-            existingTask = DownloadTask(url = url, filePath = filePath, fileName = fileName)
+            existingTask = DownloadTask(url = url, filePath = filePath, fileName = fileName, md5Expected = md5Expected)
             downloadDao.insertOrUpdateTask(existingTask) // 将新任务插入数据库
         }
 
@@ -895,6 +896,9 @@ object DownloadManager {
             Timber.d("任务 ${currentTask.id}: ResHeader 'Content-Range': ${response.header("Content-Range")}")
             Timber.d("任务 ${currentTask.id}: ResHeader 'Accept-Ranges': ${response.header("Accept-Ranges")}")
 
+            val serverMd5 = response.header("Content-MD5") ?: response.header("X-Content-MD5")
+            serverMd5?.let { downloadDao.updateMd5FromServer(currentTask.id, serverMd5) }
+
             // 在处理响应前，再次检查任务状态和协程状态
             val taskStateBeforeWrite = downloadDao.getTaskById(currentTask.id)
             if (!currentCoroutineContext().isActive || taskStateBeforeWrite == null || taskStateBeforeWrite.status != DownloadStatus.DOWNLOADING) {
@@ -1010,6 +1014,7 @@ object DownloadManager {
             var lastUiEmitTime = System.currentTimeMillis()
             var bytesSinceLastDbUpdate: Long = 0
             val dbUpdateThresholdBytes: Long = 512 * 1024 * 1024 // 每 512KB 更新一次数据库
+            val streamingMd5 = StreamingMd5()
 
             responseBody.byteStream().use { inputStream ->
                 while (true) {
@@ -1036,6 +1041,7 @@ object DownloadManager {
                     randomAccessFile.write(buffer, 0, bytesReadFromStream)
                     bytesActuallyWrittenThisSession += bytesReadFromStream
                     bytesSinceLastDbUpdate += bytesReadFromStream
+                    streamingMd5.update(buffer, 0, bytesReadFromStream)
 
                     // currentTask.downloadedBytes 是会话开始时的值
                     // 最新总下载进度 = 会话开始时的进度 + 本会话已写入的字节
@@ -1058,6 +1064,22 @@ object DownloadManager {
             val finalTotalDownloadedBytes = currentTask.downloadedBytes + bytesActuallyWrittenThisSession
             downloadDao.updateDownloadedBytes(currentTask.id, finalTotalDownloadedBytes) // 关键：保存最终精确进度
             Timber.d("任务 ${currentTask.id}: 循环结束后，最终DB进度更新为: $finalTotalDownloadedBytes")
+
+            val actualMd5 = streamingMd5.digestBase64()
+            val expected = currentTask.md5Expected ?: currentTask.md5FromServer
+            Timber.d("任务 ${currentTask.id} actualMd5 is ${actualMd5} expected is $expected md5Expected is ${currentTask.md5Expected} md5FromServer is ${currentTask.md5FromServer}")
+            when {
+                expected == null -> {
+                    Timber.d("任务 ${currentTask.id} 无需校验 MD5")
+                }
+                !actualMd5.equals(expected, ignoreCase = true) -> {
+                    updateTaskStatus(currentTask.id, DownloadStatus.FAILED, error = IOException("MD5 校验失败"))
+                    return
+                }
+                actualMd5.equals(expected, ignoreCase = true) -> {
+                    Timber.d("任务 ${currentTask.id} MD5校验成功")
+                }
+            }
 
             val finalTaskStateFromDb = downloadDao.getTaskById(currentTask.id)
             if (finalTaskStateFromDb == null) {

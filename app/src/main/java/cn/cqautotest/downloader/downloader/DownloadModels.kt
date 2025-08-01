@@ -27,7 +27,9 @@ data class DownloadTask(
     var lastModified: String? = null,
     var isPausedByNetwork: Boolean = false,
     var errorDetails: String? = null,
-    var createdAt: Long = System.currentTimeMillis() // 新增字段，并提供默认值
+    var createdAt: Long = System.currentTimeMillis(),
+    val md5Expected: String? = null, // 外部传入
+    var md5FromServer: String? = null // 服务器返回
 )
 
 data class DownloadProgress(

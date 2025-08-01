@@ -54,6 +54,9 @@ interface DownloadDao {
 
     @Query("UPDATE download_tasks SET downloadedBytes = :downloadedBytes WHERE id = :taskId")
     suspend fun updateDownloadedBytes(taskId: String, downloadedBytes: Long)
+
+    @Query("UPDATE download_tasks SET md5FromServer = :md5 WHERE id = :taskId")
+    suspend fun updateMd5FromServer(taskId: String, md5: String?)
 }
 
 @Database(entities = [DownloadTask::class], version = 1, exportSchema = false) // 版本号为 1
@@ -66,14 +69,13 @@ abstract class AppDatabase : RoomDatabase() {
 
         fun getDatabase(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
-                val instance: AppDatabase = Room.databaseBuilder(
+                Room.databaseBuilder(
                     context.applicationContext,
                     AppDatabase::class.java,
                     "download_manager_db"
                 )
                     .build()
-                INSTANCE = instance
-                instance
+                    .also { INSTANCE = it }
             }
         }
     }
