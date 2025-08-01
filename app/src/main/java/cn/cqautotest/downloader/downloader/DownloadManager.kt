@@ -47,6 +47,7 @@ object DownloadManager {
     private val downloadScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val taskQueueChannel = Channel<String>(Channel.UNLIMITED) // 用于任务ID的队列
     private val activeDownloads = ConcurrentHashMap<String, Job>() // 存储活动下载任务的Job
+    private var taskProcessorJob: Job? = null
 
     // 用于广播下载进度和状态
     private val _downloadProgressFlow = MutableSharedFlow<DownloadProgress>(
@@ -376,109 +377,136 @@ object DownloadManager {
     private fun startTaskProcessor() {
         checkInitialized()
 
-        // 在 DownloadManager 的协程作用域 (downloadScope) 中启动一个新的协程
-        downloadScope.launch {
-            Timber.d("任务处理器 (Task processor) 协程已启动。")
+        if (taskProcessorJob?.isActive == true) {
+            Timber.d("任务处理器已经在运行中。")
+            return
+        }
 
-            // 通过迭代 Channel 来处理任务。当 Channel 关闭且为空时，循环会自动结束。
-            for (taskId in taskQueueChannel) {
-                // 检查1: 当前协程是否仍然处于活动状态
-                if (!isActive) {
-                    Timber.i("任务处理器协程不再活动。正在退出。")
-                    break // 退出 for 循环
-                }
+        Timber.i("正在启动任务处理器 (Task processor)...")
+        taskProcessorJob = downloadScope.launch {
+            processDownloadTasks()
+        }
+    }
 
-                // 检查2: 在尝试获取信号量之前检查网络连接状态
-                if (!isNetworkConnected) {
-                    Timber.w("网络未连接。任务 $taskId 当前无法从队列中处理。")
-                    // 从数据库获取任务信息，以检查其当前状态
-                    val task = downloadDao.getTaskById(taskId)
-                    // 如果任务仍然是 PENDING 状态，则将其标记为因网络原因暂停
-                    if (task?.status == DownloadStatus.PENDING) {
-                        updateTaskStatus(taskId, DownloadStatus.PAUSED, isNetworkPaused = true, error = IOException("待处理任务 $taskId 处理时网络不可用"))
-                    }
-                    // 不尝试获取信号量，继续循环等待下一个任务或网络恢复
-                    continue
-                }
-
-                // 用于处理信号量获取和任务执行
-                try {
-                    Timber.d("任务处理器：正在尝试为任务 $taskId 获取信号量...")
-                    downloadSemaphore.acquire() // 挂起点：获取信号量以控制并发下载数
-                    Timber.d("任务处理器：已为任务 $taskId 获取信号量。")
-
-                    // 检查3: 在获取信号量后，再次检查协程是否活动
-                    // （因为在等待 acquire() 的过程中，协程可能已被取消）
-                    if (!isActive) {
-                        Timber.i("任务处理器在为任务 $taskId 获取信号量后变为非活动状态。正在释放信号量并退出。")
-                        downloadSemaphore.release() // 释放刚刚获取的信号量
-                        break // 退出 for 循环
-                    }
-
-                    // 步骤4: 从数据库获取最新的任务状态，确保任务适合下载
-                    val task = downloadDao.getTaskById(taskId)
-                    if (task != null && task.status == DownloadStatus.PENDING && !task.isPausedByNetwork) {
-                        // 条件满足：任务存在、状态为 PENDING、且未被网络暂停
-
-                        // 步骤5: 启动一个新的子协程来执行实际的下载操作
-                        // 使用 downloadScope.launch 创建一个与父协程 (任务处理器) 生命周期相关联的子协程
-                        val job = launch {
-                            try {
-                                executeDownload(task) // 调用核心下载函数
-                            } finally {
-                                // 确保在下载结束 (成功、失败或取消) 时释放资源
-                                Timber.d("任务处理器：正在为任务 ${task.id} 释放信号量 (下载结束或失败)。")
-                                downloadSemaphore.release() // 释放信号量，允许其他任务获取
-                                activeDownloads.remove(task.id) // 从活动下载映射中移除此任务的 Job
-                            }
-                        }
-                        activeDownloads[taskId] = job // 将新创建的下载 Job 存储起来，以便可以从外部取消它
-
-                        // 为 Job 设置完成回调，主要用于日志记录或特定取消场景的额外处理
-                        job.invokeOnCompletion { throwable ->
-                            if (throwable is CancellationException) {
-                                Timber.i("任务 $taskId 的下载 Job 通过 invokeOnCompletion 被取消: ${throwable.message}")
-                                // 注意：通常不需要在此处再次 remove activeDownloads 或 release semaphore，
-                                // 因为 Job 的取消会触发其自身的 finally 块。
-                                // 这个回调更多用于日志记录，或者在 finally 块不足以处理所有取消情况时的补充。
-                            }
-                            // 如果需要，可以在这里处理其他类型的异常，但通常 executeDownload 内部会处理下载相关的具体错误。
-                        }
-                    } else {
-                        // 如果任务不符合下载条件 (例如，状态已不是 PENDING，或者被网络暂停了)
-                        Timber.w("任务 $taskId 不符合下载条件 (状态: ${task?.status}, isPausedByNetwork: ${task?.isPausedByNetwork})。正在释放信号量。")
-                        downloadSemaphore.release() // 必须释放信号量，因为它已被获取
-                    }
-                } catch (e: InterruptedException) {
-                    // 当 downloadSemaphore.acquire() 被中断时抛出
-                    Timber.w("任务处理器：为任务 $taskId 获取信号量时被中断。正在释放信号量 (如果持有)。")
-                    Thread.currentThread().interrupt() // 重新设置当前线程的中断状态
-                    // 保守地释放信号量。更安全的方式是确保当前线程确实持有一个许可。
-                    // 由于 Semaphore 不跟踪哪个线程持有许可，我们通过检查可用许可数来间接判断。
-                    // 如果可用许可少于最大并发数，意味着当前或其他线程至少持有一个。
-                    if (downloadSemaphore.availablePermits < maxConcurrentDownloads) {
-                        downloadSemaphore.release()
-                    }
-                    break // 中断通常意味着应该停止处理，所以退出循环
-                } catch (e: CancellationException) {
-                    // 当任务处理器协程自身被取消时 (例如，在 acquire() 期间或在检查 isActive 之前)
-                    Timber.i("任务处理器：协程在处理任务 $taskId 或等待信号量时被取消。正在释放信号量 (如果持有)。")
-                    if (downloadSemaphore.availablePermits < maxConcurrentDownloads) {
-                        downloadSemaphore.release()
-                    }
-                    break // 协程被取消，退出循环
-                } catch (e: Exception) {
-                    // 捕获在获取信号量或启动任务过程中可能发生的其他未知异常
-                    Timber.e(e, "任务处理器：获取信号量或为任务 $taskId 启动下载时发生错误")
-                    // 尝试释放信号量，以防万一是在获取后、启动下载前发生的错误
-                    if (downloadSemaphore.availablePermits < maxConcurrentDownloads) {
-                        downloadSemaphore.release()
-                    }
-                    // 对于单个任务的此类失败，通常不应该中断整个任务处理器循环，
-                    // 除非是无法恢复的严重错误 (例如 OOM)。这里我们选择继续处理下一个任务。
-                }
+    private suspend fun processDownloadTasks() {
+        Timber.i("任务处理器 (Task processor) 协程已启动。")
+        for (taskId in taskQueueChannel) {
+            if (!currentCoroutineContext().isActive) {
+                Timber.i("任务处理器协程不再活动。退出循环。")
+                break
             }
-            Timber.i("任务处理器 (Task processor) 协程已结束。")
+
+            // 检查网络连接状态
+            if (!isNetworkConnected) {
+                handleNetworkUnavailable(taskId)
+                continue
+            }
+
+            // 检查任务是否存在且状态为PENDING
+            if (!isTaskValidForProcessing(taskId)) continue
+
+            // 处理信号量获取和任务执行
+            processTask(taskId)
+        }
+        Timber.i("任务处理器 (Task processor) 协程已结束。")
+    }
+
+    private suspend fun handleNetworkUnavailable(taskId: String) {
+        Timber.w("网络未连接。任务 $taskId 当前无法从队列中处理。")
+        val task = downloadDao.getTaskById(taskId)
+        if (task?.status == DownloadStatus.PENDING) {
+            updateTaskStatus(taskId, DownloadStatus.PAUSED, isNetworkPaused = true, error = IOException("待处理任务 $taskId 处理时网络不可用"))
+        }
+    }
+
+    private suspend fun isTaskValidForProcessing(taskId: String): Boolean {
+        val task = downloadDao.getTaskById(taskId)
+        if (task == null) {
+            Timber.w("任务处理器：任务 $taskId 不存在于数据库中。跳过。")
+            return false
+        }
+
+        if (task.status != DownloadStatus.PENDING) {
+            Timber.w("任务处理器：任务 $taskId 状态不是 PENDING，而是 ${task.status}。跳过。")
+            return false
+        }
+
+        if (task.isPausedByNetwork) {
+            Timber.w("任务处理器：任务 $taskId 被网络暂停。跳过。")
+            return false
+        }
+
+        return true
+    }
+
+    private suspend fun processTask(taskId: String) {
+        try {
+            Timber.d("任务处理器：正在尝试为任务 $taskId 获取信号量...")
+            downloadSemaphore.acquire() // 挂起点：获取信号量以控制并发下载数
+            Timber.d("任务处理器：已为任务 $taskId 获取信号量。")
+
+            // 检查协程是否活动
+            if (!currentCoroutineContext().isActive) {
+                Timber.i("任务处理器在为任务 $taskId 获取信号量后变为非活动状态。正在释放信号量并退出。")
+                downloadSemaphore.release()
+                return
+            }
+
+            // 从数据库获取最新的任务状态
+            val task = downloadDao.getTaskById(taskId)
+            if (task != null && task.status == DownloadStatus.PENDING && !task.isPausedByNetwork) {
+                launchDownloadJob(task)
+            } else {
+                Timber.w("任务 $taskId 不符合下载条件 (状态: ${task?.status}, isPausedByNetwork: ${task?.isPausedByNetwork})。正在释放信号量。")
+                downloadSemaphore.release()
+            }
+        } catch (e: InterruptedException) {
+            handleTaskProcessorInterruption(taskId, e)
+        } catch (e: CancellationException) {
+            handleTaskProcessorCancellation(taskId, e)
+        } catch (e: Exception) {
+            handleTaskProcessorException(taskId, e)
+        }
+    }
+
+    private fun launchDownloadJob(task: DownloadTask) {
+        val job = downloadScope.launch {
+            try {
+                executeDownload(task)
+            } finally {
+                Timber.d("任务处理器：正在为任务 ${task.id} 释放信号量 (下载结束或失败)。")
+                downloadSemaphore.release()
+                activeDownloads.remove(task.id)
+            }
+        }
+        activeDownloads[task.id] = job
+
+        job.invokeOnCompletion { throwable ->
+            if (throwable is CancellationException) {
+                Timber.i("任务 ${task.id} 的下载 Job 通过 invokeOnCompletion 被取消: ${throwable.message}")
+            }
+        }
+    }
+
+    private fun handleTaskProcessorInterruption(taskId: String, e: InterruptedException) {
+        Timber.w("任务处理器：为任务 $taskId 获取信号量时被中断。正在释放信号量 (如果持有)。")
+        Thread.currentThread().interrupt()
+        if (downloadSemaphore.availablePermits < maxConcurrentDownloads) {
+            downloadSemaphore.release()
+        }
+    }
+
+    private fun handleTaskProcessorCancellation(taskId: String, e: CancellationException) {
+        Timber.i("任务处理器：协程在处理任务 $taskId 或等待信号量时被取消。正在释放信号量 (如果持有)。")
+        if (downloadSemaphore.availablePermits < maxConcurrentDownloads) {
+            downloadSemaphore.release()
+        }
+    }
+
+    private fun handleTaskProcessorException(taskId: String, e: Exception) {
+        Timber.e(e, "任务处理器：获取信号量或为任务 $taskId 启动下载时发生错误")
+        if (downloadSemaphore.availablePermits < maxConcurrentDownloads) {
+            downloadSemaphore.release()
         }
     }
 
