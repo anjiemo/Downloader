@@ -5,6 +5,8 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.Uri
+import android.webkit.MimeTypeMap
 import cn.cqautotest.downloader.util.StreamingMd5
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -33,6 +35,7 @@ import java.net.UnknownHostException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.cancellation.CancellationException
+import androidx.core.net.toUri
 
 object DownloadManager {
 
@@ -479,7 +482,7 @@ object DownloadManager {
         }
     }
 
-    suspend fun enqueueNewDownload(url: String, dirPath: String, fileName: String, md5Expected: String? = null): String {
+    suspend fun enqueueNewDownload(url: String, dirPath: String, fileName: String, useCustomFileName: Boolean = false, md5Expected: String? = null): String {
         checkInitialized()
         val directory = File(dirPath)
         if (!directory.exists()) {
@@ -488,7 +491,8 @@ object DownloadManager {
                 throw IOException("创建目录失败: $dirPath")
             }
         }
-        val filePath = File(dirPath, fileName).absolutePath
+        val actualFileName = resolveFileName(url, emptyMap(), fileName, useCustomFileName)
+        val filePath = File(dirPath, actualFileName).absolutePath
         var existingTask = downloadDao.getTaskByFilePath(filePath) // 根据文件路径查找现有任务
 
         if (existingTask != null) {
@@ -981,6 +985,12 @@ object DownloadManager {
             // --- 处理成功的 HTTP 响应 ---
             val responseBody = response.body
             expectedContentLengthFromServer = responseBody.contentLength()
+            val realFileName = resolveFileName(currentTask.url, response.headers.toMultimap().mapValues { it.value.firstOrNull() ?: "" }, null, false)
+            if (realFileName != File(currentTask.filePath).name) {
+                val newPath = File(File(currentTask.filePath).parent, realFileName).absolutePath
+                File(currentTask.filePath).renameTo(File(newPath))
+                downloadDao.insertOrUpdateTask(currentTask.copy(filePath = newPath, fileName = realFileName))
+            }
 
             var serverReportedTotalBytesInHeader = currentTask.totalBytes
             val newETag = response.header("ETag")
@@ -1267,6 +1277,41 @@ object DownloadManager {
                 activeDownloads.remove(currentTask.id)
             }
         }
+    }
+
+    private fun resolveFileName(url: String, responseHeaders: Map<String, String>, customFileName: String?, useCustomFileName: Boolean): String {
+        if (useCustomFileName && !customFileName.isNullOrBlank()) return customFileName
+        val uri = try {
+            url.trim().toUri()
+        } catch (e: Exception) {
+            Timber.w(e,"非法 URI 格式: $url")
+            null
+        }
+
+        val disposition = responseHeaders["Content-Disposition"].orEmpty()
+        val dispositionName = disposition
+            .substringAfter("filename=")
+            .removeSurrounding("\"")
+            .substringBefore(';')
+            .takeIf { it.isNotBlank() }
+
+        val uriFileName = uri?.lastPathSegment?.takeIf { it.isNotBlank() }
+        val mimeType = responseHeaders["Content-Type"]?.lowercase()?.substringBefore(';')?.trim()
+        val inferredExt = mimeType?.let {
+            MimeTypeMap.getSingleton().getExtensionFromMimeType(it)?.let { ext -> ".$ext" }
+        }
+
+        val baseName = dispositionName ?: uriFileName ?: "download"
+        val nameWithoutExt = baseName.substringBeforeLast('.')
+        val existingExt = baseName.substringAfterLast('.', "")
+
+        val finalExt = when {
+            existingExt.isNotBlank() -> ".$existingExt"
+            inferredExt != null -> inferredExt
+            else -> ".bin"
+        }
+
+        return "$nameWithoutExt$finalExt"
     }
 
     private suspend fun handleCancellationOrError(
