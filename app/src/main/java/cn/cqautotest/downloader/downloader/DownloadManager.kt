@@ -502,7 +502,8 @@ object DownloadManager {
                             existingTask.id,
                             existingTask.downloadedBytes,
                             existingTask.totalBytes,
-                            existingTask.status
+                            existingTask.status,
+                            fileName = existingTask.fileName
                         )
                     )
                     return existingTask.id // 直接返回现有任务ID
@@ -535,7 +536,8 @@ object DownloadManager {
                             existingTask.downloadedBytes,
                             existingTask.totalBytes,
                             existingTask.status,
-                            existingTask.errorDetails?.let { IOException(it) } // 如果有错误，也一并发出
+                            existingTask.errorDetails?.let { IOException(it) }, // 如果有错误，也一并发出
+                            fileName = existingTask.fileName
                         )
                     )
                     return existingTask.id // 返回现有任务ID
@@ -559,7 +561,8 @@ object DownloadManager {
                 taskToProcess.id,
                 taskToProcess.downloadedBytes,
                 taskToProcess.totalBytes,
-                taskToProcess.status
+                taskToProcess.status,
+                fileName = fileName
             )
         )
 
@@ -604,7 +607,16 @@ object DownloadManager {
                 // 如果任务已处于其他状态 (例如已经 PAUSED, FAILED, COMPLETED)，
                 // 则不更改其状态，但仍然发出当前状态以通知监听器
                 Timber.w("无法暂停任务 $taskId。当前状态: ${task.status}。正在发出当前状态。")
-                _downloadProgressFlow.tryEmit(DownloadProgress(task.id, task.downloadedBytes, task.totalBytes, task.status, task.errorDetails?.let { IOException(it) }))
+                _downloadProgressFlow.tryEmit(
+                    DownloadProgress(
+                        task.id,
+                        task.downloadedBytes,
+                        task.totalBytes,
+                        task.status,
+                        task.errorDetails?.let { IOException(it) },
+                        fileName = task.fileName
+                    )
+                )
             }
         } else {
             Timber.w("未找到要暂停的任务 $taskId。")
@@ -628,7 +640,16 @@ object DownloadManager {
                         updateTaskStatus(taskId, DownloadStatus.PAUSED, isNetworkPaused = true, error = IOException("尝试在网络离线时恢复。原始错误: ${task.errorDetails}"))
                     } else {
                         // 如果任务已经是网络暂停状态，则仅发出当前状态，因为网络仍然不可用
-                        _downloadProgressFlow.tryEmit(DownloadProgress(task.id, task.downloadedBytes, task.totalBytes, task.status, IOException("网络不可用。原始错误: ${task.errorDetails}")))
+                        _downloadProgressFlow.tryEmit(
+                            DownloadProgress(
+                                task.id,
+                                task.downloadedBytes,
+                                task.totalBytes,
+                                task.status,
+                                IOException("网络不可用。原始错误: ${task.errorDetails}"),
+                                fileName = task.fileName
+                            )
+                        )
                     }
                     return // 网络未连接，无法恢复
                 }
@@ -653,7 +674,16 @@ object DownloadManager {
             } else {
                 // 如果任务不处于 PAUSED 或 FAILED 状态，则无法恢复
                 Timber.w("任务 $taskId 无法从当前状态恢复: ${task.status}。正在发出当前状态。")
-                _downloadProgressFlow.tryEmit(DownloadProgress(task.id, task.downloadedBytes, task.totalBytes, task.status, task.errorDetails?.let { IOException(it) }))
+                _downloadProgressFlow.tryEmit(
+                    DownloadProgress(
+                        task.id,
+                        task.downloadedBytes,
+                        task.totalBytes,
+                        task.status,
+                        task.errorDetails?.let { IOException(it) },
+                        fileName = task.fileName
+                    )
+                )
             }
         } else {
             Timber.w("未找到要恢复的任务 $taskId。")
@@ -717,7 +747,8 @@ object DownloadManager {
                     0L, // downloadedBytes 未知
                     0L, // totalBytes 未知
                     DownloadStatus.CANCELLED, // 状态设置为 CANCELLED
-                    IOException("尝试取消时未找到任务 $taskId") // 附带一个错误信息
+                    IOException("尝试取消时未找到任务 $taskId"), // 附带一个错误信息
+                    fileName = null
                 )
             )
         }
@@ -771,7 +802,8 @@ object DownloadManager {
                     updatedTask.downloadedBytes,
                     updatedTask.totalBytes,
                     newStatus, // 使用传入的 newStatus，因为 updatedTask.status 可能由于事务原因尚未在内存中立即完全同步，或者为了确保一致性
-                    error ?: updatedTask.errorDetails?.let { IOException(it) } // 优先使用传入的 error 对象；如果为 null，则尝试使用数据库中的 errorDetails (转换为 IOException)
+                    error ?: updatedTask.errorDetails?.let { IOException(it) }, // 优先使用传入的 error 对象；如果为 null，则尝试使用数据库中的 errorDetails (转换为 IOException)
+                    fileName = updatedTask.fileName
                 )
             )
             // 使用上面确定的 errorMsg 进行日志记录
@@ -798,7 +830,8 @@ object DownloadManager {
                     currentTaskBeforeUpdate?.downloadedBytes ?: 0L, // 尝试使用更新前获取的旧下载字节数，如果不存在则为 0
                     currentTaskBeforeUpdate?.totalBytes ?: 0L, // 尝试使用更新前获取的旧总字节数，如果不存在则为 0
                     newStatus, // 使用传入的新状态
-                    error ?: currentTaskBeforeUpdate?.errorDetails?.let { IOException(it) } // 优先使用传入的 error，其次是旧的 errorDetails
+                    error ?: currentTaskBeforeUpdate?.errorDetails?.let { IOException(it) }, // 优先使用传入的 error，其次是旧的 errorDetails
+                    fileName = currentTaskBeforeUpdate?.fileName
                 )
             )
         }
@@ -816,7 +849,7 @@ object DownloadManager {
                 DownloadProgress(
                     initialTaskStateFromQueue.id, 0L, 0L, DownloadStatus.FAILED,
                     IOException("任务记录在启动时丢失"),
-                    fileName = ""
+                    fileName = null
                 )
             )
             activeDownloads.remove(initialTaskStateFromQueue.id) // 清理 activeDownloads
@@ -831,8 +864,11 @@ object DownloadManager {
             if (currentTask.status == DownloadStatus.FAILED || currentTask.status == DownloadStatus.PAUSED || currentTask.status == DownloadStatus.CANCELLED) {
                 _downloadProgressFlow.tryEmit(
                     DownloadProgress(
-                        currentTask.id, currentTask.downloadedBytes, currentTask.totalBytes,
-                        currentTask.status, currentTask.errorDetails?.let { IOException(it) },
+                        currentTask.id,
+                        currentTask.downloadedBytes,
+                        currentTask.totalBytes,
+                        currentTask.status,
+                        currentTask.errorDetails?.let { IOException(it) },
                         fileName = File(currentTask.filePath).name
                     )
                 )

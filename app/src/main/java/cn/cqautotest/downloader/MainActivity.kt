@@ -106,7 +106,7 @@ fun DownloadScreen(
 
         Button(
             onClick = {
-                val urls = urlInput.value.lines().filter { it.isNotBlank() }
+                val urls = urlInput.value.split(",").map { it.trim() }.filter { it.isNotBlank() }
                 if (urls.isNotEmpty()) onStartDownloads(urls)
             },
             modifier = Modifier.fillMaxWidth()
