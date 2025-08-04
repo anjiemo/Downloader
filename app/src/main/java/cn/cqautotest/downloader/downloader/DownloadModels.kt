@@ -20,7 +20,7 @@ data class DownloadTask(
     val url: String,
     val filePath: String,
     val fileName: String,
-    var downloadedBytes: Long = 0L,
+    var downloadedBytes: Long = 0L,           // 主指针：数据库记录的下载进度
     var totalBytes: Long = 0L,
     var status: DownloadStatus = DownloadStatus.PENDING,
     var eTag: String? = null,
@@ -29,7 +29,12 @@ data class DownloadTask(
     var errorDetails: String? = null,
     var createdAt: Long = System.currentTimeMillis(),
     val md5Expected: String? = null, // 外部传入
-    var md5FromServer: String? = null // 服务器返回
+    var md5FromServer: String? = null, // 服务器返回
+    
+    // 双指针机制字段
+    var committedBytes: Long = 0L,             // 副指针：已确认写入文件的字节数
+    var lastCommitTime: Long = 0L,             // 最后提交时间
+    var fileIntegrityCheck: Boolean = false    // 文件完整性检查标志
 )
 
 data class DownloadProgress(
@@ -39,4 +44,13 @@ data class DownloadProgress(
     val status: DownloadStatus,
     val error: Throwable? = null, // 可选的错误信息
     val fileName: String? = null
+)
+
+// 文件完整性检查结果
+data class FileIntegrityResult(
+    val isValid: Boolean,
+    val actualSize: Long,
+    val expectedSize: Long,
+    val corruptionPoint: Long? = null, // 如果文件损坏，记录损坏位置
+    val errorMessage: String? = null
 )

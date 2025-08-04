@@ -26,6 +26,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.internal.closeQuietly
+import okio.Buffer
 import timber.log.Timber
 import java.io.File
 import java.io.IOException
@@ -338,6 +339,8 @@ object DownloadManager {
                 // 这样做可以统一后续处理逻辑，因为所有中断的任务都会先进入 PAUSED 状态
                 if (currentTaskState.status == DownloadStatus.DOWNLOADING) {
                     Timber.i("任务 ${currentTaskState.id} 状态为 DOWNLOADING，设置为 PAUSED (启动时被中断)。")
+                    Timber.d("任务 ${currentTaskState.id} 双指针状态: 主指针=${currentTaskState.downloadedBytes}, 副指针=${currentTaskState.committedBytes}")
+                    
                     // 保留原始的网络暂停状态
                     updateTaskStatus(currentTaskState.id, DownloadStatus.PAUSED, currentTaskState.isPausedByNetwork, IOException("下载因应用重启被中断"))
                     // 重新获取任务状态，因为上面已经更新了
@@ -900,7 +903,7 @@ object DownloadManager {
             return // 任务不存在，无法继续
         }
         currentTask = taskFromDbOnEntry
-        Timber.i("executeDownload 开始处理任务 ${currentTask.id} (${currentTask.fileName})。URL: ${currentTask.url}。初始数据库状态: ${currentTask.status}，已下载: ${currentTask.downloadedBytes}")
+        Timber.i("executeDownload 开始处理任务 ${currentTask.id} (${currentTask.fileName})。URL: ${currentTask.url}。初始数据库状态: ${currentTask.status}，已下载: ${currentTask.downloadedBytes}，已确认: ${currentTask.committedBytes}")
 
         // --- 步骤 2: 验证任务是否处于可开始的状态 ---
         if (currentTask.status != DownloadStatus.PENDING || currentTask.isPausedByNetwork) {
@@ -923,11 +926,21 @@ object DownloadManager {
             return
         }
 
-        // --- 步骤 3: 将任务状态更新为 DOWNLOADING ---
-        // 注意：这里传入的 isNetworkPaused 应该是 false，因为我们要开始下载了
+        // --- 步骤 3: 执行文件完整性检查和双指针同步 ---
+        val integrityResult = checkFileIntegrity(currentTask)
+        if (!integrityResult.isValid) {
+            Timber.w("任务 ${currentTask.id} 文件完整性检查失败: ${integrityResult.errorMessage}")
+            // 文件损坏，重置到安全位置
+            val safePosition = integrityResult.corruptionPoint ?: 0L
+            Timber.i("任务 ${currentTask.id} 重置双指针到安全位置: $safePosition")
+            downloadDao.resetPointers(currentTask.id, safePosition)
+            currentTask = downloadDao.getTaskById(currentTask.id) ?: return
+        }
+
+        // --- 步骤 4: 将任务状态更新为 DOWNLOADING ---
         updateTaskStatus(currentTask.id, DownloadStatus.DOWNLOADING, isNetworkPaused = false, error = null)
 
-        // --- 步骤 4: 在设置为 DOWNLOADING 后重新获取任务状态，并记录进入下载时的初始字节数 ---
+        // --- 步骤 5: 在设置为 DOWNLOADING 后重新获取任务状态，并记录进入下载时的初始字节数 ---
         val taskAfterUpdateToDownloading = downloadDao.getTaskById(currentTask.id)
         if (taskAfterUpdateToDownloading == null) {
             Timber.e("任务 ${currentTask.id} 在状态更新为 DOWNLOADING 后从数据库消失。")
@@ -940,16 +953,19 @@ object DownloadManager {
         }
         currentTask = taskAfterUpdateToDownloading
         val initialDownloadedBytesForSession = currentTask.downloadedBytes
+        val initialCommittedBytesForSession = currentTask.committedBytes
         var bytesActuallyWrittenThisSession: Long = 0 // 本次下载会话实际写入文件的字节数
-        Timber.d("任务 ${currentTask.id} 已确认状态为 DOWNLOADING。文件: ${currentTask.fileName}。会话开始时已下载: $initialDownloadedBytesForSession")
+        Timber.d("任务 ${currentTask.id} 已确认状态为 DOWNLOADING。文件: ${currentTask.fileName}。会话开始时已下载: $initialDownloadedBytesForSession，已确认: $initialCommittedBytesForSession")
         val requestBuilder = Request.Builder().url(currentTask.url)
         var expectedContentLengthFromServer: Long = -1 // 用于跟踪本次 HTTP 响应头中的 Content-Length
 
-        if (initialDownloadedBytesForSession > 0) {
-            requestBuilder.addHeader("Range", "bytes=${initialDownloadedBytesForSession}-")
+        // 使用downloadedBytes作为Range请求的起始位置，这是用户看到的进度
+        val resumePosition = currentTask.downloadedBytes
+        if (resumePosition > 0) {
+            requestBuilder.addHeader("Range", "bytes=${resumePosition}-")
             currentTask.eTag?.let { requestBuilder.addHeader("If-Range", it) }
                 ?: currentTask.lastModified?.let { requestBuilder.addHeader("If-Range", it) }
-            Timber.d("任务 ${currentTask.id}: 从 $initialDownloadedBytesForSession 字节处恢复下载。")
+            Timber.d("任务 ${currentTask.id}: 从 $resumePosition 字节处恢复下载 (downloadedBytes)。")
         }
 
         var response: Response? = null
@@ -1038,14 +1054,14 @@ object DownloadManager {
 
             if (response.code == 200) { // HTTP 200 OK (完整内容)
                 Timber.i("任务 ${currentTask.id}: 收到 HTTP 200 OK。会话的初始下载字节数: $initialDownloadedBytesForSession. 将从头开始下载。")
-                if (initialDownloadedBytesForSession > 0) {
-                    Timber.w("任务 ${currentTask.id}: 收到 HTTP 200，但之前有进度 ($initialDownloadedBytesForSession bytes)。重置数据库进度为 0。")
-                    downloadDao.updateDownloadedBytes(currentTask.id, 0L)
-                    currentTask = currentTask.copy(downloadedBytes = 0L)
+                if (resumePosition > 0) {
+                    Timber.w("任务 ${currentTask.id}: 收到 HTTP 200，但之前有进度 ($resumePosition bytes)。重置双指针为 0。")
+                    downloadDao.resetPointers(currentTask.id, 0L)
+                    currentTask = currentTask.copy(downloadedBytes = 0L, committedBytes = 0L)
                 }
                 serverReportedTotalBytesInHeader = expectedContentLengthFromServer
             } else if (response.code == 206) { // HTTP 206 Partial Content
-                Timber.d("任务 ${currentTask.id}: 成功恢复下载 (HTTP 206)。从 ${currentTask.downloadedBytes} 开始。")
+                Timber.d("任务 ${currentTask.id}: 成功恢复下载 (HTTP 206)。从 $resumePosition 开始。")
                 val contentRange = response.header("Content-Range")
                 val serverTotalFromRange = contentRange?.substringAfterLast('/')?.toLongOrNull()
                 if (serverTotalFromRange != null && serverTotalFromRange > 0) {
@@ -1053,9 +1069,9 @@ object DownloadManager {
                 }
             } else {
                 Timber.w("任务 ${currentTask.id}: 收到未知成功码 ${response.code}。按 HTTP 200 处理。")
-                if (initialDownloadedBytesForSession > 0) {
-                    downloadDao.updateDownloadedBytes(currentTask.id, 0L)
-                    currentTask = currentTask.copy(downloadedBytes = 0L)
+                if (resumePosition > 0) {
+                    downloadDao.resetPointers(currentTask.id, 0L)
+                    currentTask = currentTask.copy(downloadedBytes = 0L, committedBytes = 0L)
                 }
                 serverReportedTotalBytesInHeader = expectedContentLengthFromServer
             }
@@ -1096,17 +1112,24 @@ object DownloadManager {
 
             // 验证文件长度与已下载字节数是否匹配
             if (fileLength != currentTask.downloadedBytes) {
-                Timber.w("任务 ${currentTask.id}: 文件长度不匹配，重新开始下载")
-                randomAccessFile.setLength(0)
-                downloadDao.updateDownloadedBytes(currentTask.id, 0L)
-                currentTask = currentTask.copy(downloadedBytes = 0L)
+                Timber.w("任务 ${currentTask.id}: 文件长度 (${fileLength}) 与已下载字节数 (${currentTask.downloadedBytes}) 不匹配")
+                if (fileLength > currentTask.downloadedBytes) {
+                    // 文件比记录的大，可能是上次中断时写入不完整，截断到安全位置
+                    Timber.i("任务 ${currentTask.id}: 截断文件到安全位置: ${currentTask.downloadedBytes}")
+                    randomAccessFile.setLength(currentTask.downloadedBytes)
+                } else {
+                    // 文件比记录的小，重置双指针
+                    Timber.i("任务 ${currentTask.id}: 文件长度小于记录，重置双指针到文件长度: $fileLength")
+                    downloadDao.resetPointers(currentTask.id, fileLength)
+                    currentTask = currentTask.copy(downloadedBytes = fileLength, committedBytes = fileLength)
+                }
             }
 
             randomAccessFile.seek(currentTask.downloadedBytes)
 
-            // 移除流式MD5计算，改用完整文件校验
+            // 简化的双指针机制：正常情况下主指针和副指针同步更新
             var bytesSinceLastDbUpdate: Long = 0
-            val dbUpdateThresholdBytes: Long = 2 * 1024 * 1024 // 2MB
+            val dbUpdateThresholdBytes: Long = 1 * 1024 * 1024 // 1MB - 更新阈值
             var bytesReadFromStream: Int
             var lastUiEmitTime = System.currentTimeMillis()
             val buffer = ByteArray(8192)
@@ -1137,12 +1160,12 @@ object DownloadManager {
                     bytesActuallyWrittenThisSession += bytesReadFromStream
                     bytesSinceLastDbUpdate += bytesReadFromStream
 
-                    // 更新数据库进度
+                    // 同步更新双指针
                     if (bytesSinceLastDbUpdate >= dbUpdateThresholdBytes) {
-                        val currentTotalDownloadedInMemory = currentTask.downloadedBytes + bytesActuallyWrittenThisSession
-                        downloadDao.updateDownloadedBytes(currentTask.id, currentTotalDownloadedInMemory)
+                        val newDownloadedBytes = currentTask.downloadedBytes + bytesActuallyWrittenThisSession
+                        downloadDao.updateBothPointers(currentTask.id, newDownloadedBytes, newDownloadedBytes)
                         bytesSinceLastDbUpdate = 0
-                        Timber.v("任务 ${currentTask.id} DB进度更新: $currentTotalDownloadedInMemory/${currentTask.totalBytes}")
+                        Timber.v("任务 ${currentTask.id} 双指针同步更新: $newDownloadedBytes/${currentTask.totalBytes}")
                     }
 
                     // 更新UI进度
@@ -1163,9 +1186,42 @@ object DownloadManager {
                 }
             }
 
-            // 下载完成后计算整个文件的MD5
+            // 下载完成后同步双指针到最终位置
             val finalTotalDownloadedBytes = currentTask.downloadedBytes + bytesActuallyWrittenThisSession
-            downloadDao.updateDownloadedBytes(currentTask.id, finalTotalDownloadedBytes)
+            downloadDao.updateBothPointers(currentTask.id, finalTotalDownloadedBytes, finalTotalDownloadedBytes)
+            Timber.i("任务 ${currentTask.id} 下载完成，双指针同步到: $finalTotalDownloadedBytes")
+
+            // 强制刷新文件缓冲区到磁盘，确保所有数据都已写入
+            try {
+                randomAccessFile?.fd?.sync()
+                Timber.d("任务 ${currentTask.id} 文件已同步到磁盘")
+            } catch (e: IOException) {
+                Timber.w(e, "任务 ${currentTask.id} 文件同步失败，但继续处理: ${e.message}")
+            }
+
+            // 关闭文件句柄，确保所有数据都已写入
+            try {
+                randomAccessFile?.close()
+                randomAccessFile = null
+                Timber.d("任务 ${currentTask.id} 文件句柄已关闭")
+            } catch (e: IOException) {
+                Timber.e(e, "任务 ${currentTask.id} 关闭文件句柄失败: ${e.message}")
+            }
+
+            // 等待一小段时间确保文件系统完成写入
+            kotlinx.coroutines.delay(100)
+
+            // 验证文件大小是否正确
+            val actualFileSize = file.length()
+            val expectedFileSize = finalTotalDownloadedBytes
+            
+            if (actualFileSize != expectedFileSize) {
+                Timber.e("任务 ${currentTask.id} 文件大小验证失败：期望大小=$expectedFileSize, 实际大小=$actualFileSize")
+                updateTaskStatus(currentTask.id, DownloadStatus.FAILED, error = IOException("文件大小不匹配：期望=$expectedFileSize, 实际=$actualFileSize"))
+                return
+            }
+            
+            Timber.i("任务 ${currentTask.id} 文件大小验证通过：$actualFileSize bytes")
 
             if (file.exists()) {
                 val actualMd5 = calculateFileMd5(file)
@@ -1241,14 +1297,18 @@ object DownloadManager {
             Timber.i(e, "任务 ${currentTask.id} 的下载被取消: ${e.message}")
             // 关键: 在取消时，保存当前会话实际已下载的进度
             val currentDownloadedBeforeError = currentTask.downloadedBytes + bytesActuallyWrittenThisSession
-            downloadDao.updateDownloadedBytes(currentTask.id, currentDownloadedBeforeError)
+            downloadDao.updateBothPointers(currentTask.id, currentDownloadedBeforeError, currentDownloadedBeforeError)
+            
+            Timber.d("任务 ${currentTask.id} 取消时双指针更新为: $currentDownloadedBeforeError")
 
             // isNetworkIssue false, 因为是外部/用户取消，除非特定情况
             handleCancellationOrError(currentTask.id, DownloadStatus.PAUSED, e, false)
         } catch (e: IOException) {
             Timber.e(e, "任务 ${currentTask.id} 下载期间发生 IOException。原始消息: '${e.message}'") // 打印原始异常消息
             val currentDownloadedBeforeError = currentTask.downloadedBytes + bytesActuallyWrittenThisSession
-            downloadDao.updateDownloadedBytes(currentTask.id, currentDownloadedBeforeError)
+            downloadDao.updateBothPointers(currentTask.id, currentDownloadedBeforeError, currentDownloadedBeforeError)
+            
+            Timber.d("任务 ${currentTask.id} IOException时双指针更新为: $currentDownloadedBeforeError")
 
             // --- 开始详细诊断 isLikelySuddenNetworkLoss ---
             val exceptionIsSocketException = e is SocketException
@@ -1306,11 +1366,18 @@ object DownloadManager {
         } catch (e: Exception) {
             Timber.e(e, "任务 ${currentTask.id} 下载期间发生意外错误: ${e.message}")
             val currentDownloadedBeforeError = currentTask.downloadedBytes + bytesActuallyWrittenThisSession
-            downloadDao.updateDownloadedBytes(currentTask.id, currentDownloadedBeforeError)
+            downloadDao.updateBothPointers(currentTask.id, currentDownloadedBeforeError, currentDownloadedBeforeError)
+            
+            Timber.d("任务 ${currentTask.id} 异常时双指针更新为: $currentDownloadedBeforeError")
+            
             handleCancellationOrError(currentTask.id, DownloadStatus.FAILED, e, !isNetworkConnected)
         } finally {
             try {
-                randomAccessFile?.closeQuietly()
+                // 只有在文件句柄还没有关闭的情况下才关闭
+                if (randomAccessFile != null) {
+                    randomAccessFile?.closeQuietly()
+                    Timber.d("任务 ${currentTask.id} 在finally块中关闭文件句柄")
+                }
             } catch (e: IOException) {
                 Timber.e(e, "为任务 ${currentTask.id} 关闭 randomAccessFile 时出错")
             }
@@ -1436,6 +1503,81 @@ object DownloadManager {
         }
     }
 
+    /**
+     * 检查文件完整性，验证双指针一致性
+     */
+    private suspend fun checkFileIntegrity(task: DownloadTask): FileIntegrityResult {
+        val file = File(task.filePath)
+        
+        if (!file.exists()) {
+            return FileIntegrityResult(
+                isValid = false,
+                actualSize = 0L,
+                expectedSize = task.downloadedBytes,
+                errorMessage = "文件不存在"
+            )
+        }
+
+        val actualFileSize = file.length()
+        val expectedSize = task.downloadedBytes
+
+        // 检查文件大小是否与主指针一致
+        if (actualFileSize != expectedSize) {
+            Timber.w("任务 ${task.id} 文件完整性检查失败: 实际大小=$actualFileSize, 期望大小=$expectedSize")
+            return FileIntegrityResult(
+                isValid = false,
+                actualSize = actualFileSize,
+                expectedSize = expectedSize,
+                corruptionPoint = if (actualFileSize < expectedSize) actualFileSize else expectedSize,
+                errorMessage = "文件大小不匹配: 实际=$actualFileSize, 期望=$expectedSize"
+            )
+        }
+
+        // 检查主指针和副指针的差异是否在合理范围内
+        val pointerDiff = task.downloadedBytes - task.committedBytes
+        val maxAllowedDiff = 2 * 1024 * 1024 // 允许2MB的差异
+        
+        if (pointerDiff > maxAllowedDiff) {
+            Timber.w("任务 ${task.id} 双指针差异过大: 主指针=${task.downloadedBytes}, 副指针=${task.committedBytes}, 差异=$pointerDiff")
+            return FileIntegrityResult(
+                isValid = false,
+                actualSize = actualFileSize,
+                expectedSize = expectedSize,
+                corruptionPoint = task.committedBytes,
+                errorMessage = "双指针差异过大: $pointerDiff bytes"
+            )
+        }
+
+        // 如果文件存在且大小正确，进行基本的数据完整性检查
+        if (actualFileSize > 0) {
+            try {
+                // 简单检查：尝试读取文件的最后一个字节
+                RandomAccessFile(file, "r").use { raf ->
+                    if (actualFileSize > 0) {
+                        raf.seek(actualFileSize - 1)
+                        raf.read() // 如果文件损坏，这里可能会抛出异常
+                    }
+                }
+            } catch (e: Exception) {
+                Timber.e(e, "任务 ${task.id} 文件读取检查失败")
+                return FileIntegrityResult(
+                    isValid = false,
+                    actualSize = actualFileSize,
+                    expectedSize = expectedSize,
+                    corruptionPoint = actualFileSize - 1,
+                    errorMessage = "文件读取失败: ${e.message}"
+                )
+            }
+        }
+
+        Timber.d("任务 ${task.id} 文件完整性检查通过: 大小=$actualFileSize, 主指针=${task.downloadedBytes}, 副指针=${task.committedBytes}")
+        return FileIntegrityResult(
+            isValid = true,
+            actualSize = actualFileSize,
+            expectedSize = expectedSize
+        )
+    }
+
     suspend fun getAllTasks(application: Application): List<DownloadTask> {
         return AppDatabase.getDatabase(application).downloadDao().getAllTasks()
     }
@@ -1482,5 +1624,44 @@ object DownloadManager {
         } catch (e: Exception) {
             Timber.e(e, "Raw Test Exception")
         }
+    }
+
+    /**
+     * 测试双指针机制的功能
+     */
+    suspend fun testDualPointerMechanism(taskId: String) {
+        checkInitialized()
+        val task = downloadDao.getTaskById(taskId)
+        if (task == null) {
+            Timber.e("测试任务 $taskId 不存在")
+            return
+        }
+
+        Timber.i("=== 双指针机制测试 ===")
+        Timber.i("任务ID: ${task.id}")
+        Timber.i("文件名: ${task.fileName}")
+        Timber.i("主指针 (downloadedBytes): ${task.downloadedBytes}")
+        Timber.i("副指针 (committedBytes): ${task.committedBytes}")
+        Timber.i("指针差异: ${task.downloadedBytes - task.committedBytes} bytes")
+        Timber.i("最后提交时间: ${task.lastCommitTime}")
+
+        val file = File(task.filePath)
+        if (file.exists()) {
+            val actualFileSize = file.length()
+            Timber.i("实际文件大小: $actualFileSize bytes")
+            Timber.i("文件大小与副指针匹配: ${actualFileSize == task.committedBytes}")
+        } else {
+            Timber.i("文件不存在")
+        }
+
+        // 执行完整性检查
+        val integrityResult = checkFileIntegrity(task)
+        Timber.i("文件完整性检查结果: ${integrityResult.isValid}")
+        if (!integrityResult.isValid) {
+            Timber.i("错误信息: ${integrityResult.errorMessage}")
+            Timber.i("损坏位置: ${integrityResult.corruptionPoint}")
+        }
+
+        Timber.i("=== 测试完成 ===")
     }
 }

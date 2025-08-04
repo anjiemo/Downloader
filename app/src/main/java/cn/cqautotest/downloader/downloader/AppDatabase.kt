@@ -57,9 +57,34 @@ interface DownloadDao {
 
     @Query("UPDATE download_tasks SET md5FromServer = :md5 WHERE id = :taskId")
     suspend fun updateMd5FromServer(taskId: String, md5: String?)
+
+    // 双指针机制相关方法
+    /**
+     * 更新已确认写入文件的字节数（副指针）
+     */
+    @Query("UPDATE download_tasks SET committedBytes = :committedBytes, lastCommitTime = :commitTime WHERE id = :taskId")
+    suspend fun updateCommittedBytes(taskId: String, committedBytes: Long, commitTime: Long = System.currentTimeMillis())
+
+    /**
+     * 同时更新主指针和副指针
+     */
+    @Query("UPDATE download_tasks SET downloadedBytes = :downloadedBytes, committedBytes = :committedBytes, lastCommitTime = :commitTime WHERE id = :taskId")
+    suspend fun updateBothPointers(taskId: String, downloadedBytes: Long, committedBytes: Long, commitTime: Long = System.currentTimeMillis())
+
+    /**
+     * 设置文件完整性检查标志
+     */
+    @Query("UPDATE download_tasks SET fileIntegrityCheck = :isValid WHERE id = :taskId")
+    suspend fun setFileIntegrityCheck(taskId: String, isValid: Boolean)
+
+    /**
+     * 重置双指针到指定位置
+     */
+    @Query("UPDATE download_tasks SET downloadedBytes = :position, committedBytes = :position, lastCommitTime = :commitTime WHERE id = :taskId")
+    suspend fun resetPointers(taskId: String, position: Long, commitTime: Long = System.currentTimeMillis())
 }
 
-@Database(entities = [DownloadTask::class], version = 1, exportSchema = false) // 版本号为 1
+@Database(entities = [DownloadTask::class], version = 2, exportSchema = false) // 版本号升级到 2
 abstract class AppDatabase : RoomDatabase() {
     abstract fun downloadDao(): DownloadDao
 
@@ -74,6 +99,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "download_manager_db"
                 )
+                    .fallbackToDestructiveMigration() // 添加迁移策略，简化处理
                     .build()
                     .also { INSTANCE = it }
             }
