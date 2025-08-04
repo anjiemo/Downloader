@@ -1,5 +1,6 @@
 package cn.cqautotest.downloader.downloader
 
+import android.app.Application
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
@@ -1433,6 +1434,10 @@ object DownloadManager {
             }
             Base64.encodeToString(md.digest(), Base64.NO_WRAP)
         }
+    }
+
+    suspend fun getAllTasks(application: Application): List<DownloadTask> {
+        return AppDatabase.getDatabase(application).downloadDao().getAllTasks()
     }
 
     suspend fun testRawOkHttpSpeed(url: String, client: OkHttpClient) {
