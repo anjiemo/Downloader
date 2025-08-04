@@ -82,11 +82,55 @@ interface DownloadDao {
      */
     @Query("UPDATE download_tasks SET downloadedBytes = :position, committedBytes = :position, lastCommitTime = :commitTime WHERE id = :taskId")
     suspend fun resetPointers(taskId: String, position: Long, commitTime: Long = System.currentTimeMillis())
+
+    // 分片下载相关方法
+    /**
+     * 更新下载模式和分片配置
+     */
+    @Query("UPDATE download_tasks SET downloadMode = :mode, chunkSize = :chunkSize, maxConcurrentChunks = :maxChunks, supportsRangeRequests = :supportsRange, chunkCount = :chunkCount WHERE id = :taskId")
+    suspend fun updateChunkedConfig(taskId: String, mode: DownloadMode, chunkSize: Long, maxChunks: Int, supportsRange: Boolean, chunkCount: Int)
+
+    /**
+     * 更新服务器Range请求支持状态
+     */
+    @Query("UPDATE download_tasks SET supportsRangeRequests = :supports WHERE id = :taskId")
+    suspend fun updateRangeSupport(taskId: String, supports: Boolean)
 }
 
-@Database(entities = [DownloadTask::class], version = 2, exportSchema = false) // 版本号升级到 2
+@Dao
+interface ChunkDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertOrUpdateChunk(chunk: DownloadChunk)
+
+    @Query("SELECT * FROM download_chunks WHERE taskId = :taskId ORDER BY chunkIndex")
+    suspend fun getChunksByTaskId(taskId: String): List<DownloadChunk>
+
+    @Query("SELECT * FROM download_chunks WHERE taskId = :taskId AND status = :status")
+    suspend fun getChunksByTaskIdAndStatus(taskId: String, status: DownloadStatus): List<DownloadChunk>
+
+    @Query("UPDATE download_chunks SET downloadedBytes = :downloadedBytes, status = :status WHERE id = :chunkId")
+    suspend fun updateChunkProgress(chunkId: String, downloadedBytes: Long, status: DownloadStatus)
+
+    @Query("UPDATE download_chunks SET status = :status, errorDetails = :error WHERE id = :chunkId")
+    suspend fun updateChunkStatus(chunkId: String, status: DownloadStatus, error: String?)
+
+    @Query("UPDATE download_chunks SET retryCount = retryCount + 1, lastRetryTime = :retryTime WHERE id = :chunkId")
+    suspend fun incrementRetryCount(chunkId: String, retryTime: Long = System.currentTimeMillis())
+
+    @Query("DELETE FROM download_chunks WHERE taskId = :taskId")
+    suspend fun deleteChunksByTaskId(taskId: String)
+
+    @Query("SELECT COUNT(*) FROM download_chunks WHERE taskId = :taskId AND status = :status")
+    suspend fun getChunkCountByStatus(taskId: String, status: DownloadStatus): Int
+
+    @Query("SELECT SUM(downloadedBytes) FROM download_chunks WHERE taskId = :taskId")
+    suspend fun getTotalDownloadedBytesForTask(taskId: String): Long?
+}
+
+@Database(entities = [DownloadTask::class, DownloadChunk::class], version = 3, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun downloadDao(): DownloadDao
+    abstract fun chunkDao(): ChunkDao
 
     companion object {
         @Volatile
@@ -99,9 +143,8 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "download_manager_db"
                 )
-                    .fallbackToDestructiveMigration() // 添加迁移策略，简化处理
-                    .build()
-                    .also { INSTANCE = it }
+                .build()
+                .also { INSTANCE = it }
             }
         }
     }

@@ -10,11 +10,15 @@ import android.util.Base64
 import android.webkit.MimeTypeMap
 import androidx.core.net.toUri
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -26,7 +30,6 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.internal.closeQuietly
-import okio.Buffer
 import timber.log.Timber
 import java.io.File
 import java.io.IOException
@@ -42,6 +45,7 @@ object DownloadManager {
 
     private lateinit var appContext: Context
     private lateinit var downloadDao: DownloadDao // 假设这是你的Room DAO接口
+    private lateinit var chunkDao: ChunkDao // 分片下载DAO
     private lateinit var okHttpClient: OkHttpClient
     private lateinit var connectivityManager: ConnectivityManager
 
@@ -118,6 +122,8 @@ object DownloadManager {
         }
         // 创建一个 Semaphore (信号量) 来控制并发下载的数量
         downloadSemaphore = Semaphore(maxConcurrentDownloads)
+        downloadDao = AppDatabase.getDatabase(context).downloadDao()
+        chunkDao = AppDatabase.getDatabase(context).chunkDao()
         okHttpClient = client ?: createDefaultOkHttpClient(config)
         connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         isInitialized = true
@@ -340,7 +346,7 @@ object DownloadManager {
                 if (currentTaskState.status == DownloadStatus.DOWNLOADING) {
                     Timber.i("任务 ${currentTaskState.id} 状态为 DOWNLOADING，设置为 PAUSED (启动时被中断)。")
                     Timber.d("任务 ${currentTaskState.id} 双指针状态: 主指针=${currentTaskState.downloadedBytes}, 副指针=${currentTaskState.committedBytes}")
-                    
+
                     // 保留原始的网络暂停状态
                     updateTaskStatus(currentTaskState.id, DownloadStatus.PAUSED, currentTaskState.isPausedByNetwork, IOException("下载因应用重启被中断"))
                     // 重新获取任务状态，因为上面已经更新了
@@ -487,7 +493,11 @@ object DownloadManager {
     private fun launchDownloadJob(task: DownloadTask) {
         val job = downloadScope.launch {
             try {
-                executeDownload(task)
+                // 根据下载模式选择执行方法
+                when (task.downloadMode) {
+                    DownloadMode.CHUNKED -> executeChunkedDownload(task)
+                    DownloadMode.SINGLE -> executeDownload(task)
+                }
             } finally {
                 Timber.d("任务处理器：正在为任务 ${task.id} 释放信号量 (下载结束或失败)。")
                 downloadSemaphore.release()
@@ -525,7 +535,14 @@ object DownloadManager {
         }
     }
 
-    suspend fun enqueueNewDownload(url: String, dirPath: String, fileName: String, useCustomFileName: Boolean = false, md5Expected: String? = null): String {
+    suspend fun enqueueNewDownload(
+        url: String,
+        dirPath: String,
+        fileName: String,
+        useCustomFileName: Boolean = false,
+        md5Expected: String? = null,
+        chunkedConfig: ChunkedDownloadConfig? = null
+    ): String {
         checkInitialized()
         val directory = File(dirPath)
         if (!directory.exists()) {
@@ -593,7 +610,23 @@ object DownloadManager {
         } else {
             // 没有找到现有任务，创建一个新的下载任务
             Timber.i("文件 '$actualFileName' 在 '$dirPath' 不存在现有任务。正在创建新任务。")
-            existingTask = DownloadTask(url = url, filePath = filePath, fileName = actualFileName, md5Expected = md5Expected)
+
+            // 根据配置决定是否使用分片下载
+            val downloadMode = if (chunkedConfig?.enabled == true) {
+                DownloadMode.CHUNKED
+            } else {
+                DownloadMode.SINGLE
+            }
+
+            existingTask = DownloadTask(
+                url = url,
+                filePath = filePath,
+                fileName = actualFileName,
+                md5Expected = md5Expected,
+                downloadMode = downloadMode,
+                chunkSize = chunkedConfig?.chunkSize ?: 1024 * 1024 * 1024, // 默认1GB
+                maxConcurrentChunks = chunkedConfig?.maxConcurrentChunks ?: 3
+            )
             downloadDao.insertOrUpdateTask(existingTask) // 将新任务插入数据库
         }
 
@@ -1214,13 +1247,13 @@ object DownloadManager {
             // 验证文件大小是否正确
             val actualFileSize = file.length()
             val expectedFileSize = finalTotalDownloadedBytes
-            
+
             if (actualFileSize != expectedFileSize) {
                 Timber.e("任务 ${currentTask.id} 文件大小验证失败：期望大小=$expectedFileSize, 实际大小=$actualFileSize")
                 updateTaskStatus(currentTask.id, DownloadStatus.FAILED, error = IOException("文件大小不匹配：期望=$expectedFileSize, 实际=$actualFileSize"))
                 return
             }
-            
+
             Timber.i("任务 ${currentTask.id} 文件大小验证通过：$actualFileSize bytes")
 
             if (file.exists()) {
@@ -1298,7 +1331,7 @@ object DownloadManager {
             // 关键: 在取消时，保存当前会话实际已下载的进度
             val currentDownloadedBeforeError = currentTask.downloadedBytes + bytesActuallyWrittenThisSession
             downloadDao.updateBothPointers(currentTask.id, currentDownloadedBeforeError, currentDownloadedBeforeError)
-            
+
             Timber.d("任务 ${currentTask.id} 取消时双指针更新为: $currentDownloadedBeforeError")
 
             // isNetworkIssue false, 因为是外部/用户取消，除非特定情况
@@ -1307,7 +1340,7 @@ object DownloadManager {
             Timber.e(e, "任务 ${currentTask.id} 下载期间发生 IOException。原始消息: '${e.message}'") // 打印原始异常消息
             val currentDownloadedBeforeError = currentTask.downloadedBytes + bytesActuallyWrittenThisSession
             downloadDao.updateBothPointers(currentTask.id, currentDownloadedBeforeError, currentDownloadedBeforeError)
-            
+
             Timber.d("任务 ${currentTask.id} IOException时双指针更新为: $currentDownloadedBeforeError")
 
             // --- 开始详细诊断 isLikelySuddenNetworkLoss ---
@@ -1367,18 +1400,16 @@ object DownloadManager {
             Timber.e(e, "任务 ${currentTask.id} 下载期间发生意外错误: ${e.message}")
             val currentDownloadedBeforeError = currentTask.downloadedBytes + bytesActuallyWrittenThisSession
             downloadDao.updateBothPointers(currentTask.id, currentDownloadedBeforeError, currentDownloadedBeforeError)
-            
+
             Timber.d("任务 ${currentTask.id} 异常时双指针更新为: $currentDownloadedBeforeError")
-            
+
             handleCancellationOrError(currentTask.id, DownloadStatus.FAILED, e, !isNetworkConnected)
         } finally {
             try {
                 // 只有在文件句柄还没有关闭的情况下才关闭
-                if (randomAccessFile != null) {
-                    randomAccessFile?.closeQuietly()
-                    Timber.d("任务 ${currentTask.id} 在finally块中关闭文件句柄")
-                }
-            } catch (e: IOException) {
+                randomAccessFile?.closeQuietly()
+                Timber.d("任务 ${currentTask.id} 在finally块中关闭文件句柄")
+            } catch (e: Exception) {
                 Timber.e(e, "为任务 ${currentTask.id} 关闭 randomAccessFile 时出错")
             }
             try {
@@ -1508,7 +1539,7 @@ object DownloadManager {
      */
     private suspend fun checkFileIntegrity(task: DownloadTask): FileIntegrityResult {
         val file = File(task.filePath)
-        
+
         if (!file.exists()) {
             return FileIntegrityResult(
                 isValid = false,
@@ -1536,7 +1567,7 @@ object DownloadManager {
         // 检查主指针和副指针的差异是否在合理范围内
         val pointerDiff = task.downloadedBytes - task.committedBytes
         val maxAllowedDiff = 2 * 1024 * 1024 // 允许2MB的差异
-        
+
         if (pointerDiff > maxAllowedDiff) {
             Timber.w("任务 ${task.id} 双指针差异过大: 主指针=${task.downloadedBytes}, 副指针=${task.committedBytes}, 差异=$pointerDiff")
             return FileIntegrityResult(
@@ -1663,5 +1694,526 @@ object DownloadManager {
         }
 
         Timber.i("=== 测试完成 ===")
+    }
+
+    // ==================== 分片下载功能 ====================
+
+    /**
+     * 便捷的分片下载方法
+     */
+    suspend fun enqueueChunkedDownload(
+        url: String,
+        dirPath: String,
+        fileName: String,
+        config: ChunkedDownloadConfig = ChunkedDownloadConfig()
+    ): String {
+        return enqueueNewDownload(
+            url = url,
+            dirPath = dirPath,
+            fileName = fileName,
+            chunkedConfig = config.copy(enabled = true)
+        )
+    }
+
+    /**
+     * 检查服务器是否支持Range请求
+     */
+    private suspend fun checkRangeSupport(url: String): Boolean {
+        return try {
+            val request = Request.Builder()
+                .url(url)
+                .addHeader("Range", "bytes=0-0")
+                .build()
+
+            val response = withContext(Dispatchers.IO) {
+                okHttpClient.newCall(request).execute()
+            }
+            response.use { response ->
+                val supportsRange = response.code == 206 ||
+                        response.headers["Accept-Ranges"]?.equals("bytes", ignoreCase = true) == true
+                Timber.d("服务器Range支持检查: $supportsRange (HTTP ${response.code})")
+                supportsRange
+            }
+        } catch (e: Exception) {
+            Timber.w(e, "检查Range支持时出错")
+            false
+        }
+    }
+
+    /**
+     * 创建分片任务
+     */
+    private suspend fun createChunks(task: DownloadTask): List<DownloadChunk> {
+        val chunks = mutableListOf<DownloadChunk>()
+        val totalSize = task.totalBytes
+        val chunkSize = task.chunkSize
+
+        var chunkIndex = 0
+        var startByte = 0L
+
+        while (startByte < totalSize) {
+            val endByte = minOf(startByte + chunkSize - 1, totalSize - 1)
+            val chunk = DownloadChunk(
+                taskId = task.id,
+                chunkIndex = chunkIndex,
+                startByte = startByte,
+                endByte = endByte
+            )
+            chunks.add(chunk)
+            chunkDao.insertOrUpdateChunk(chunk)
+
+            startByte = endByte + 1
+            chunkIndex++
+        }
+
+        // 更新任务的分片数量
+        downloadDao.updateChunkedConfig(
+            taskId = task.id,
+            mode = task.downloadMode,
+            chunkSize = task.chunkSize,
+            maxChunks = task.maxConcurrentChunks,
+            supportsRange = task.supportsRangeRequests,
+            chunkCount = chunks.size
+        )
+
+        Timber.i("任务 ${task.id} 创建了 ${chunks.size} 个分片")
+        return chunks
+    }
+
+    /**
+     * 执行分片下载
+     */
+    private suspend fun executeChunkedDownload(task: DownloadTask) {
+        checkInitialized()
+
+        try {
+            // 1. 检查服务器是否支持Range请求
+            val supportsRange = checkRangeSupport(task.url)
+            downloadDao.updateRangeSupport(task.id, supportsRange)
+
+            if (!supportsRange) {
+                Timber.w("服务器不支持Range请求，回退到单线程下载")
+                task.downloadMode = DownloadMode.SINGLE
+                downloadDao.updateChunkedConfig(
+                    taskId = task.id,
+                    mode = DownloadMode.SINGLE,
+                    chunkSize = task.chunkSize,
+                    maxChunks = task.maxConcurrentChunks,
+                    supportsRange = false,
+                    chunkCount = 0
+                )
+                executeDownload(task)
+                return
+            }
+
+            // 2. 获取文件大小（如果还不知道）
+            if (task.totalBytes <= 0) {
+                val fileSize = getFileSize(task.url)
+                downloadDao.updateTotalBytes(task.id, fileSize)
+                task.totalBytes = fileSize
+            }
+
+            // 3. 检查是否需要创建分片
+            val existingChunks = chunkDao.getChunksByTaskId(task.id)
+            val chunks = existingChunks.ifEmpty {
+                createChunks(task)
+            }
+
+            // 4. 检查文件大小是否足够进行分片下载
+            if (task.totalBytes < task.chunkSize) {
+                Timber.i("文件大小 ${task.totalBytes} 小于分片大小 ${task.chunkSize}，使用单线程下载")
+                task.downloadMode = DownloadMode.SINGLE
+                downloadDao.updateChunkedConfig(
+                    taskId = task.id,
+                    mode = DownloadMode.SINGLE,
+                    chunkSize = task.chunkSize,
+                    maxChunks = task.maxConcurrentChunks,
+                    supportsRange = supportsRange,
+                    chunkCount = 0
+                )
+                executeDownload(task)
+                return
+            }
+
+            // 5. 开始分片下载
+            downloadChunks(task, chunks)
+
+        } catch (e: Exception) {
+            Timber.e(e, "分片下载执行失败: ${task.id}")
+            updateTaskStatus(task.id, DownloadStatus.FAILED, error = e)
+        }
+    }
+
+    /**
+     * 下载所有分片
+     */
+    private suspend fun downloadChunks(task: DownloadTask, chunks: List<DownloadChunk>) {
+        val file = File(task.filePath)
+        val parentDir = file.parentFile
+        if (parentDir != null && !parentDir.exists()) {
+            parentDir.mkdirs()
+        }
+
+        // 创建或清空目标文件
+        if (!file.exists()) {
+            file.createNewFile()
+        }
+
+        val randomAccessFile = RandomAccessFile(file, "rw")
+        randomAccessFile.setLength(task.totalBytes)
+        randomAccessFile.close()
+
+        // 使用信号量控制并发分片数
+        val chunkSemaphore = Semaphore(task.maxConcurrentChunks)
+        val chunkResults = mutableListOf<Deferred<Boolean>>()
+
+        try {
+            // 启动所有分片下载
+            chunks.forEach { chunk ->
+                val deferred = downloadScope.async {
+                    chunkSemaphore.withPermit {
+                        downloadChunk(task, chunk)
+                    }
+                }
+                chunkResults.add(deferred)
+            }
+
+            // 等待所有分片完成并收集结果
+            val results = chunkResults.awaitAll()
+            val successCount = results.count { it }
+            val failureCount = results.size - successCount
+
+            Timber.i("分片下载结果: 成功=$successCount, 失败=$failureCount, 总计=${chunks.size}")
+
+            // 检查是否所有分片都成功完成
+            val completedChunks = chunkDao.getChunksByTaskIdAndStatus(task.id, DownloadStatus.COMPLETED)
+            val failedChunks = chunkDao.getChunksByTaskIdAndStatus(task.id, DownloadStatus.FAILED)
+            val pendingChunks = chunkDao.getChunksByTaskIdAndStatus(task.id, DownloadStatus.PENDING)
+
+            Timber.i("分片状态统计: 完成=${completedChunks.size}, 失败=${failedChunks.size}, 等待中=${pendingChunks.size}")
+
+            if (completedChunks.size == chunks.size) {
+                // 所有分片完成，进行文件完整性检查
+                val finalTask = downloadDao.getTaskById(task.id) ?: return
+                val integrityResult = checkFileIntegrity(finalTask)
+
+                if (integrityResult.isValid) {
+                    updateTaskStatus(task.id, DownloadStatus.COMPLETED)
+                    Timber.i("分片下载完成: ${task.id}")
+                } else {
+                    updateTaskStatus(task.id, DownloadStatus.FAILED, error = IOException("文件完整性检查失败"))
+                }
+            } else if (failedChunks.isNotEmpty()) {
+                // 有分片失败，尝试恢复策略
+                handleFailedChunks(task, failedChunks, completedChunks.size, chunks.size)
+            } else if (pendingChunks.isNotEmpty()) {
+                // 有分片仍在等待中（可能是重试中）
+                Timber.w("部分分片仍在处理中，任务状态保持为下载中")
+                // 不更新任务状态，让它继续重试
+            } else {
+                // 其他情况
+                updateTaskStatus(task.id, DownloadStatus.FAILED, error = IOException("分片下载状态异常"))
+            }
+
+        } catch (e: Exception) {
+            Timber.e(e, "分片下载过程中出现未处理的异常: ${task.id}")
+            updateTaskStatus(task.id, DownloadStatus.FAILED, error = e)
+        }
+    }
+
+    /**
+     * 下载单个分片
+     */
+    private suspend fun downloadChunk(task: DownloadTask, chunk: DownloadChunk): Boolean {
+        val file = File(task.filePath)
+        var randomAccessFile: RandomAccessFile? = null
+        var response: Response? = null
+
+        try {
+            // 更新分片状态为下载中
+            chunkDao.updateChunkStatus(chunk.id, DownloadStatus.DOWNLOADING, null)
+
+            // 创建Range请求
+            val requestBuilder = Request.Builder()
+                .url(task.url)
+                .addHeader("Range", "bytes=${chunk.startByte}-${chunk.endByte}")
+
+            task.eTag?.let { requestBuilder.addHeader("If-Range", it) }
+                ?: task.lastModified?.let { requestBuilder.addHeader("If-Range", it) }
+
+            val request = requestBuilder.build()
+            response = okHttpClient.newCall(request).execute()
+
+            if (!response.isSuccessful) {
+                throw IOException("HTTP ${response.code}: ${response.message}")
+            }
+
+            // 验证响应
+            val contentRange = response.header("Content-Range")
+            val expectedRange = "bytes ${chunk.startByte}-${chunk.endByte}/${task.totalBytes}"
+            if (contentRange != null && contentRange != expectedRange) {
+                Timber.w("Content-Range不匹配: 期望=$expectedRange, 实际=$contentRange")
+            }
+
+            // 写入文件
+            randomAccessFile = RandomAccessFile(file, "rw")
+            randomAccessFile.seek(chunk.startByte)
+
+            val buffer = ByteArray(8192)
+            var bytesRead: Int
+            var totalBytesRead = 0L
+
+            response.body.byteStream().use { inputStream ->
+                while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                    randomAccessFile.write(buffer, 0, bytesRead)
+                    totalBytesRead += bytesRead
+
+                    // 更新分片进度
+                    chunkDao.updateChunkProgress(chunk.id, totalBytesRead, DownloadStatus.DOWNLOADING)
+
+                    // 检查是否超出分片范围
+                    if (totalBytesRead > (chunk.endByte - chunk.startByte + 1)) {
+                        Timber.w("分片 ${chunk.chunkIndex} 下载超出范围")
+                        break
+                    }
+                }
+            }
+
+            // 强制刷新到磁盘
+            randomAccessFile.fd.sync()
+            randomAccessFile.close()
+            randomAccessFile = null
+
+            // 更新分片状态为完成
+            chunkDao.updateChunkStatus(chunk.id, DownloadStatus.COMPLETED, null)
+
+            // 更新总进度
+            updateChunkedProgress(task.id)
+
+            Timber.d("分片 ${chunk.chunkIndex} 下载完成: ${totalBytesRead} bytes")
+            return true
+
+        } catch (e: Exception) {
+            val errorMessage = when (e) {
+                is SocketException -> "网络连接异常: ${e.message}"
+                is ConnectException -> "连接失败: ${e.message}"
+                is UnknownHostException -> "无法解析主机: ${e.message}"
+                is IOException -> "IO异常: ${e.message}"
+                else -> "未知异常: ${e.message}"
+            }
+            
+            Timber.e(e, "分片 ${chunk.chunkIndex} 下载失败: $errorMessage")
+            
+            // 重试逻辑
+            if (chunk.retryCount < 3) {
+                chunkDao.incrementRetryCount(chunk.id)
+                chunkDao.updateChunkStatus(chunk.id, DownloadStatus.PENDING, "重试中 (${chunk.retryCount + 1}/3)")
+                
+                val retryDelay = when (e) {
+                    is SocketException -> 2000L * (chunk.retryCount + 1) // 网络异常，延长重试间隔
+                    is ConnectException -> 3000L * (chunk.retryCount + 1) // 连接失败，更长的重试间隔
+                    else -> 1000L * (chunk.retryCount + 1) // 其他异常，标准重试间隔
+                }
+                
+                Timber.i("分片 ${chunk.chunkIndex} 将在 ${retryDelay}ms 后重试 (${e.javaClass.simpleName})")
+                delay(retryDelay)
+                
+                // 递归重试
+                return downloadChunk(task, chunk)
+            } else {
+                // 重试次数用完，标记为失败
+                chunkDao.updateChunkStatus(chunk.id, DownloadStatus.FAILED, "重试失败: $errorMessage")
+                Timber.w("分片 ${chunk.chunkIndex} 重试次数已用完，标记为失败: $errorMessage")
+                return false
+            }
+        } finally {
+            randomAccessFile?.closeQuietly()
+            response?.closeQuietly()
+        }
+    }
+
+    /**
+     * 处理失败的分片，尝试恢复策略
+     */
+    private suspend fun handleFailedChunks(
+        task: DownloadTask, 
+        failedChunks: List<DownloadChunk>, 
+        completedCount: Int, 
+        totalCount: Int
+    ) {
+        val failedChunkDetails = failedChunks.joinToString(", ") { 
+            "分片${it.chunkIndex}(${it.errorDetails})" 
+        }
+        
+        Timber.w("检测到失败的分片: $failedChunkDetails")
+        Timber.i("分片完成情况: $completedCount/$totalCount")
+        
+        // 计算成功率
+        val successRate = completedCount.toFloat() / totalCount
+        
+        when {
+            // 如果成功率超过80%，尝试重新下载失败的分片
+            successRate >= 0.8f -> {
+                Timber.i("成功率 ${(successRate * 100).toInt()}% 较高，尝试重新下载失败的分片")
+                retryFailedChunks(task, failedChunks)
+            }
+            // 如果成功率在50%-80%之间，考虑切换到单线程下载
+            successRate >= 0.5f -> {
+                Timber.w("成功率 ${(successRate * 100).toInt()}% 中等，建议切换到单线程下载")
+                fallbackToSingleDownload(task, "分片下载成功率过低: ${(successRate * 100).toInt()}%")
+            }
+            // 如果成功率低于50%，直接失败
+            else -> {
+                val errorMessage = "分片下载成功率过低 (${(successRate * 100).toInt()}%): $failedChunkDetails"
+                Timber.e(errorMessage)
+                updateTaskStatus(task.id, DownloadStatus.FAILED, error = IOException(errorMessage))
+            }
+        }
+    }
+
+    /**
+     * 重新尝试下载失败的分片
+     */
+    private suspend fun retryFailedChunks(task: DownloadTask, failedChunks: List<DownloadChunk>) {
+        Timber.i("开始重新下载 ${failedChunks.size} 个失败的分片")
+        
+        // 重置失败分片的状态
+        failedChunks.forEach { chunk ->
+            chunkDao.updateChunkStatus(chunk.id, DownloadStatus.PENDING, "重新尝试下载")
+            chunkDao.updateChunkProgress(chunk.id, 0L, DownloadStatus.PENDING)
+        }
+        
+        // 重新下载失败的分片
+        val retryResults = failedChunks.map { chunk ->
+            downloadScope.async {
+                downloadChunk(task, chunk)
+            }
+        }.awaitAll()
+        
+        val retrySuccessCount = retryResults.count { it }
+        val retryFailureCount = retryResults.size - retrySuccessCount
+        
+        Timber.i("重试结果: 成功=$retrySuccessCount, 失败=$retryFailureCount")
+        
+        if (retryFailureCount == 0) {
+            // 所有重试都成功，检查文件完整性
+            val finalTask = downloadDao.getTaskById(task.id) ?: return
+            val integrityResult = checkFileIntegrity(finalTask)
+            
+            if (integrityResult.isValid) {
+                updateTaskStatus(task.id, DownloadStatus.COMPLETED)
+                Timber.i("重试成功，分片下载完成: ${task.id}")
+            } else {
+                updateTaskStatus(task.id, DownloadStatus.FAILED, error = IOException("重试后文件完整性检查失败"))
+            }
+        } else {
+            // 仍有分片失败，切换到单线程下载
+            val stillFailedChunks = chunkDao.getChunksByTaskIdAndStatus(task.id, DownloadStatus.FAILED)
+            val stillFailedDetails = stillFailedChunks.joinToString(", ") { 
+                "分片${it.chunkIndex}(${it.errorDetails})" 
+            }
+            fallbackToSingleDownload(task, "重试后仍有分片失败: $stillFailedDetails")
+        }
+    }
+
+    /**
+     * 回退到单线程下载
+     */
+    private suspend fun fallbackToSingleDownload(task: DownloadTask, reason: String) {
+        Timber.w("回退到单线程下载: $reason")
+        
+        // 更新任务配置为单线程模式
+        task.downloadMode = DownloadMode.SINGLE
+        downloadDao.updateChunkedConfig(
+            taskId = task.id,
+            mode = DownloadMode.SINGLE,
+            chunkSize = task.chunkSize,
+            maxChunks = task.maxConcurrentChunks,
+            supportsRange = task.supportsRangeRequests,
+            chunkCount = 0
+        )
+        
+        // 清理分片数据
+        chunkDao.deleteChunksByTaskId(task.id)
+        
+        // 执行单线程下载
+        executeDownload(task)
+    }
+
+    /**
+     * 更新分片下载的总进度
+     */
+    private suspend fun updateChunkedProgress(taskId: String) {
+        val totalDownloaded = chunkDao.getTotalDownloadedBytesForTask(taskId) ?: 0L
+        val task = downloadDao.getTaskById(taskId) ?: return
+
+        downloadDao.updateBothPointers(taskId, totalDownloaded, totalDownloaded)
+
+        // 发送进度更新
+        val chunks = chunkDao.getChunksByTaskId(taskId)
+        val chunkProgress = chunks.map { chunk ->
+            val progress = if (chunk.endByte - chunk.startByte + 1 > 0) {
+                chunk.downloadedBytes.toFloat() / (chunk.endByte - chunk.startByte + 1)
+            } else 0f
+
+            ChunkProgress(
+                chunkIndex = chunk.chunkIndex,
+                startByte = chunk.startByte,
+                endByte = chunk.endByte,
+                downloadedBytes = chunk.downloadedBytes,
+                status = chunk.status,
+                progress = progress
+            )
+        }
+
+        _downloadProgressFlow.tryEmit(
+            DownloadProgress(
+                taskId = taskId,
+                downloadedBytes = totalDownloaded,
+                totalBytes = task.totalBytes,
+                status = task.status,
+                fileName = task.fileName,
+                downloadMode = DownloadMode.CHUNKED,
+                chunkProgress = chunkProgress
+            )
+        )
+    }
+
+    /**
+     * 获取文件大小
+     */
+    private suspend fun getFileSize(url: String): Long {
+        val request = Request.Builder()
+            .url(url)
+            .head() // 使用HEAD请求获取文件信息
+            .build()
+
+        val response = withContext(Dispatchers.IO) {
+            okHttpClient.newCall(request).execute()
+        }
+        response.use { response ->
+            if (!response.isSuccessful) {
+                throw IOException("无法获取文件信息: HTTP ${response.code}")
+            }
+
+            val contentLength = response.header("Content-Length")
+            if (contentLength != null) {
+                return contentLength.toLong()
+            } else {
+                throw IOException("服务器未提供Content-Length")
+            }
+        }
+    }
+
+    /**
+     * 信号量扩展函数
+     */
+    private suspend fun <T> Semaphore.withPermit(block: suspend () -> T): T {
+        acquire()
+        try {
+            return block()
+        } finally {
+            release()
+        }
     }
 }

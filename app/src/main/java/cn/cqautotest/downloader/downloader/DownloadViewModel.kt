@@ -82,7 +82,8 @@ class DownloadViewModel(private val application: Application) : ViewModel() {
             urls.forEach { url ->
                 // 确保文件名对每个URL都是唯一的，即使它们在同一毫秒内被添加
                 val fileName = "${System.currentTimeMillis()}_${url.hashCode().toString(36)}_${UUID.randomUUID().toString().take(4)}.apk"
-                DownloadManager.enqueueNewDownload(url.trim(), downloadDir.absolutePath, fileName)
+                val chunkedConfig = ChunkedDownloadConfig(enabled = true)
+                DownloadManager.enqueueNewDownload(url.trim(), downloadDir.absolutePath, fileName, chunkedConfig = chunkedConfig)
             }
         }
     }
