@@ -5,10 +5,9 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
-import android.net.Uri
 import android.util.Base64
 import android.webkit.MimeTypeMap
-
+import androidx.core.net.toUri
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -36,8 +35,6 @@ import java.net.UnknownHostException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.cancellation.CancellationException
-import androidx.core.net.toUri
-import okio.`-DeprecatedOkio`.buffer
 
 object DownloadManager {
 
@@ -72,7 +69,8 @@ object DownloadManager {
         val maxConcurrent: Int = 3,
         val connectTimeoutSeconds: Long = 20L,
         val readTimeoutSeconds: Long = 60L,
-        val writeTimeoutSeconds: Long = 60L
+        val writeTimeoutSeconds: Long = 60L,
+        val enableGzip: Boolean = true
     )
 
     private fun createDefaultOkHttpClient(config: Config): OkHttpClient {
@@ -80,6 +78,17 @@ object DownloadManager {
             .connectTimeout(config.connectTimeoutSeconds, TimeUnit.SECONDS)
             .readTimeout(config.readTimeoutSeconds, TimeUnit.SECONDS)
             .writeTimeout(config.writeTimeoutSeconds, TimeUnit.SECONDS)
+            .apply {
+                if (config.enableGzip) {
+                    addInterceptor { chain ->
+                        val newRequest = chain.request()
+                            .newBuilder()
+                            .addHeader("Accept-Encoding", "gzip")
+                            .build()
+                        chain.proceed(newRequest)
+                    }
+                }
+            }
             .build()
     }
 
@@ -1083,7 +1092,7 @@ object DownloadManager {
 
             randomAccessFile = RandomAccessFile(file, "rw")
             val fileLength = randomAccessFile.length()
-            
+
             // 验证文件长度与已下载字节数是否匹配
             if (fileLength != currentTask.downloadedBytes) {
                 Timber.w("任务 ${currentTask.id}: 文件长度不匹配，重新开始下载")
@@ -1091,12 +1100,12 @@ object DownloadManager {
                 downloadDao.updateDownloadedBytes(currentTask.id, 0L)
                 currentTask = currentTask.copy(downloadedBytes = 0L)
             }
-            
+
             randomAccessFile.seek(currentTask.downloadedBytes)
-            
+
             // 移除流式MD5计算，改用完整文件校验
             var bytesSinceLastDbUpdate: Long = 0
-            val dbUpdateThresholdBytes: Long = 512 * 1024 // 512KB
+            val dbUpdateThresholdBytes: Long = 2 * 1024 * 1024 // 2MB
             var bytesReadFromStream: Int
             var lastUiEmitTime = System.currentTimeMillis()
             val buffer = ByteArray(8192)
@@ -1160,17 +1169,19 @@ object DownloadManager {
             if (file.exists()) {
                 val actualMd5 = calculateFileMd5(file)
                 val expected = currentTask.md5Expected ?: currentTask.md5FromServer
-                
+
                 when {
                     expected == null -> {
                         Timber.d("任务 ${currentTask.id} 无需校验 MD5")
                         updateTaskStatus(currentTask.id, DownloadStatus.COMPLETED)
                     }
+
                     !actualMd5.equals(expected, ignoreCase = true) -> {
                         Timber.e("任务 ${currentTask.id} MD5校验失败：期望值=$expected, 实际值=$actualMd5")
                         updateTaskStatus(currentTask.id, DownloadStatus.FAILED, error = IOException("MD5 校验失败"))
                         return
                     }
+
                     else -> {
                         Timber.d("任务 ${currentTask.id} MD5校验成功")
                         updateTaskStatus(currentTask.id, DownloadStatus.COMPLETED)
@@ -1420,7 +1431,7 @@ object DownloadManager {
             while (fis.read(buffer).also { bytesRead = it } != -1) {
                 md.update(buffer, 0, bytesRead)
             }
-            Base64.encodeToString(md.digest(), android.util.Base64.NO_WRAP)
+            Base64.encodeToString(md.digest(), Base64.NO_WRAP)
         }
     }
 
