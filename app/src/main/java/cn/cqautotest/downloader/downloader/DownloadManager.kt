@@ -1193,7 +1193,7 @@ object DownloadManager {
 
             // 强制刷新文件缓冲区到磁盘，确保所有数据都已写入
             try {
-                randomAccessFile?.fd?.sync()
+                randomAccessFile.fd.sync()
                 Timber.d("任务 ${currentTask.id} 文件已同步到磁盘")
             } catch (e: IOException) {
                 Timber.w(e, "任务 ${currentTask.id} 文件同步失败，但继续处理: ${e.message}")
@@ -1201,7 +1201,7 @@ object DownloadManager {
 
             // 关闭文件句柄，确保所有数据都已写入
             try {
-                randomAccessFile?.close()
+                randomAccessFile.closeQuietly()
                 randomAccessFile = null
                 Timber.d("任务 ${currentTask.id} 文件句柄已关闭")
             } catch (e: IOException) {
