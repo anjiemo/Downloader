@@ -71,23 +71,25 @@ class DownloadManager(
 
     @Volatile
     private var isInitialized = false // DownloadManager 初始化标志
+    private var isEnableGzip = true
 
     // 下载配置数据类
     data class Config(
         val maxConcurrent: Int = 3,
-        val connectTimeoutSeconds: Long = 20L,
+        val connectTimeoutSeconds: Long = 10L,
         val readTimeoutSeconds: Long = 60L,
-        val writeTimeoutSeconds: Long = 60L,
+        val writeTimeoutSeconds: Long = 30L,
         val enableGzip: Boolean = true
     )
 
     private fun createDefaultOkHttpClient(config: Config): OkHttpClient {
+        val enableGzip = config.enableGzip.also { isEnableGzip = it }
         return OkHttpClient.Builder()
             .connectTimeout(config.connectTimeoutSeconds, TimeUnit.SECONDS)
             .readTimeout(config.readTimeoutSeconds, TimeUnit.SECONDS)
             .writeTimeout(config.writeTimeoutSeconds, TimeUnit.SECONDS)
             .apply {
-                if (config.enableGzip) {
+                if (enableGzip) {
                     addInterceptor { chain ->
                         val newRequest = chain.request()
                             .newBuilder()
@@ -105,13 +107,8 @@ class DownloadManager(
             Timber.w("DownloadManager 已经初始化。")
             return
         }
-        // 设置最大并发下载数
-        maxConcurrentDownloads = config.maxConcurrent
-        // 对最大并发数进行校验，确保其至少为1，避免无效值导致问题
-        if (maxConcurrentDownloads <= 0) {
-            Timber.w("maxConcurrentDownloads 配置为 ${config.maxConcurrent}，这是一个无效值。将设置为默认值 1 以避免问题。")
-            maxConcurrentDownloads = 1
-        }
+        // 设置最大并发下载数，确保其至少为1，避免无效值导致问题
+        maxConcurrentDownloads = config.maxConcurrent.coerceAtLeast(1)
 
         // 创建一个 Semaphore (信号量) 来控制并发下载的数量
         downloadSemaphore = Semaphore(maxConcurrentDownloads)
@@ -613,8 +610,7 @@ class DownloadManager(
             connectTimeoutSeconds = okHttpClient.connectTimeoutMillis.toLong(),
             readTimeoutSeconds = okHttpClient.readTimeoutMillis.toLong(),
             writeTimeoutSeconds = okHttpClient.writeTimeoutMillis.toLong(),
-            // TODO: 获取是否启用 Gzip
-            enableGzip = true
+            enableGzip = isEnableGzip
         )
     }
 
@@ -1052,7 +1048,8 @@ class DownloadManager(
         randomAccessFile.close()
 
         // 使用信号量控制并发分片数
-        val chunkSemaphore = Semaphore(task.maxConcurrentChunks)
+        val concurrentChunks = task.maxConcurrentChunks.coerceAtLeast(1)
+        val chunkSemaphore = Semaphore(concurrentChunks)
         val chunkResults = mutableListOf<Deferred<Boolean>>()
 
         try {
