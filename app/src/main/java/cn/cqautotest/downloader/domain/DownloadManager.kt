@@ -911,8 +911,12 @@ class DownloadManager(
                 Timber.i("分片 ${chunk.chunkIndex} 将在 ${retryDelay}ms 后重试 (${e.javaClass.simpleName})")
                 delay(retryDelay)
 
+                val newChunk = repository.getChunkById(chunk.id) ?: run {
+                    Timber.e("分片 ${chunk.chunkIndex} 不存在，预期的分片id：${chunk.id}")
+                    return false
+                }
                 // 递归重试
-                return downloadChunk(task, chunk)
+                return downloadChunk(task, newChunk)
             } else {
                 // 重试次数用完，标记为失败
                 repository.updateChunkStatus(chunk.id, DownloadStatus.FAILED, "重试失败: $errorMessage")
