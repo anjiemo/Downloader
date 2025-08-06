@@ -73,7 +73,9 @@ class DownloadManager(
     private var isInitialized = false // DownloadManager 初始化标志
     private var isEnableGzip = true
 
-    // 下载配置数据类
+    /**
+     * 下载配置数据类
+     */
     data class Config(
         val maxConcurrent: Int = 3,
         val connectTimeoutSeconds: Long = 10L,
@@ -358,7 +360,7 @@ class DownloadManager(
                 fileName = actualFileName,
                 md5Expected = md5Expected,
                 downloadMode = downloadMode,
-                chunkSize = chunkedConfig?.chunkSize ?: 1024 * 1024 * 1024, // 默认1GB
+                chunkSize = chunkedConfig?.chunkSize ?: (1024 * 1024 * 1024), // 默认1GB
                 maxConcurrentChunks = chunkedConfig?.maxConcurrentChunks ?: 3
             )
             repository.insertOrUpdateTask(existingTask) // 将新任务插入数据库
@@ -728,6 +730,7 @@ class DownloadManager(
         }
     }
 
+    // region 分片下载相关
     /**
      * 创建分片任务
      */
@@ -1173,6 +1176,9 @@ class DownloadManager(
         }
     }
 
+    /**
+     * 便捷的分片下载方法
+     */
     suspend fun enqueueChunkedDownload(
         url: String,
         dirPath: String,
@@ -1186,6 +1192,7 @@ class DownloadManager(
             chunkedConfig = config.copy(enabled = true)
         )
     }
+    // endregion
 
     /**
      * 检查文件完整性，验证双指针一致性

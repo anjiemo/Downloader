@@ -9,6 +9,7 @@ import cn.cqautotest.downloader.entity.DownloadStatus
 
 @Dao
 interface ChunkDao {
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertOrUpdateChunk(chunk: DownloadChunk)
 

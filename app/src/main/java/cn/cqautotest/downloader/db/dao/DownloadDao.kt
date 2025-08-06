@@ -10,6 +10,7 @@ import cn.cqautotest.downloader.entity.DownloadTask
 
 @Dao
 interface DownloadDao {
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertOrUpdateTask(task: DownloadTask)
 
@@ -31,22 +32,14 @@ interface DownloadDao {
     @Query("SELECT * FROM download_tasks")
     suspend fun getAllTasks(): List<DownloadTask>
 
-    // 之前的 setPausedByNetwork 可能可以被 updateStatus 覆盖，或者根据具体逻辑保留。
-    // 如果 updateStatus 总是会更新 isPausedByNetwork，那单独的 setPausedByNetwork 可能就不需要了。
-    // 为了与 DownloadManager 的现有逻辑保持一致（比如它有时只更新isPausedByNetwork），我们暂时保留它或确保 updateStatus 能处理好所有情况。
-    // 不过，DownloadManager 中的 updateTaskStatus 实际上总是同时更新 status 和 isPausedByNetwork，
-    // 所以单独的 setPausedByNetwork 在 DownloadManager 的当前实现中没有被直接调用。
-    // @Query("UPDATE download_tasks SET isPausedByNetwork = :isPausedByNetwork WHERE id = :taskId")
-    // suspend fun setPausedByNetwork(taskId: String, isPausedByNetwork: Boolean) // 考虑是否移除
-
     /**
-     * Updates the ETag and Last-Modified headers for a task.
+     * 更新任务的ETag和Last-Modified头信息。
      */
     @Query("UPDATE download_tasks SET eTag = :eTag, lastModified = :lastModified WHERE id = :taskId")
     suspend fun updateETagAndLastModified(taskId: String, eTag: String?, lastModified: String?)
 
     /**
-     * Updates only the totalBytes for a task.
+     * 仅更新任务的totalBytes（总字节数）。
      */
     @Query("UPDATE download_tasks SET totalBytes = :totalBytes WHERE id = :taskId")
     suspend fun updateTotalBytes(taskId: String, totalBytes: Long)
@@ -57,7 +50,7 @@ interface DownloadDao {
     @Query("UPDATE download_tasks SET md5FromServer = :md5 WHERE id = :taskId")
     suspend fun updateMd5FromServer(taskId: String, md5: String?)
 
-    // 双指针机制相关方法
+    // region 双指针机制相关方法
     /**
      * 更新已确认写入文件的字节数（副指针）
      */
@@ -81,8 +74,9 @@ interface DownloadDao {
      */
     @Query("UPDATE download_tasks SET downloadedBytes = :position, committedBytes = :position, lastCommitTime = :commitTime WHERE id = :taskId")
     suspend fun resetPointers(taskId: String, position: Long, commitTime: Long = System.currentTimeMillis())
+    // endregion
 
-    // 分片下载相关方法
+    // region 分片下载相关方法
     /**
      * 更新下载模式和分片配置
      */
@@ -94,4 +88,5 @@ interface DownloadDao {
      */
     @Query("UPDATE download_tasks SET supportsRangeRequests = :supports WHERE id = :taskId")
     suspend fun updateRangeSupport(taskId: String, supports: Boolean)
+    // endregion
 }
