@@ -1,7 +1,7 @@
-package cn.cqautotest.downloader.util
+package cn.cqautotest.downloader.util.log
 
 import android.os.Build
-import timber.log.Timber.DebugTree
+import timber.log.Timber
 
 /**
  *    author : Android 轮子哥
@@ -9,7 +9,7 @@ import timber.log.Timber.DebugTree
  *    time   : 2020/08/12
  *    desc   : 自定义日志打印规则
  */
-class DebugLoggerTree : DebugTree() {
+class DebugLoggerTree : Timber.DebugTree() {
 
     companion object {
         private const val MAX_TAG_LENGTH: Int = 23

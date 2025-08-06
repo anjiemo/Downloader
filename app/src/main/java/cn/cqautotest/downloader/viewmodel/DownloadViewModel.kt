@@ -1,13 +1,20 @@
-package cn.cqautotest.downloader.downloader
+package cn.cqautotest.downloader.viewmodel
 
 import android.app.Application
 import android.os.Environment
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import cn.cqautotest.downloader.domain.usecase.DownloadUseCase
+import cn.cqautotest.downloader.entity.ChunkedDownloadConfig
+import cn.cqautotest.downloader.entity.DownloadProgress
+import cn.cqautotest.downloader.entity.DownloadStatus
+import cn.cqautotest.downloader.entity.DownloadTask
+import cn.cqautotest.downloader.entity.DownloadTaskUiState
+import cn.cqautotest.downloader.entity.DownloadUiState
+import cn.cqautotest.downloader.util.format.DownloadFormatter
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import timber.log.Timber
@@ -15,7 +22,7 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
-class DownloadViewModel(private val application: Application) : ViewModel() {
+class DownloadViewModel(private val application: Application, private val downloadUseCase: DownloadUseCase) : ViewModel() {
 
     private val _uiState = MutableStateFlow(DownloadUiState())
     val uiState: StateFlow<DownloadUiState> = _uiState.asStateFlow()
@@ -25,7 +32,10 @@ class DownloadViewModel(private val application: Application) : ViewModel() {
 
     init {
         viewModelScope.launch {
-            DownloadManager.downloadProgressFlow.collect { progress ->
+            // 初始化时加载已保存的任务
+            loadSavedTasks()
+
+            downloadUseCase.getDownloadProgressFlow().collect { progress ->
                 updateTaskStateWithProgress(progress)
             }
         }
@@ -64,41 +74,67 @@ class DownloadViewModel(private val application: Application) : ViewModel() {
 
     fun loadSavedTasks() {
         viewModelScope.launch {
-            val savedTasks = DownloadManager.getAllTasks(application) // 确保 DownloadManager 中有此函数
-            savedTasks.forEach { dbTask ->
-                // 如果任务不在当前状态中，或者它处于最终状态（完成、失败、取消），则从数据库加载/更新
-                // 这可以防止覆盖正在进行的下载的实时进度
-                if (!taskStates.containsKey(dbTask.id) || taskStates[dbTask.id]?.status?.isFinalState() == true) {
-                    updateTaskStateWithDbTask(dbTask)
+            try {
+                val savedTasks = downloadUseCase.getAllTasks()
+                savedTasks.forEach { dbTask ->
+                    // 如果任务不在当前状态中，或者它处于最终状态（完成、失败、取消），则从数据库加载/更新
+                    // 这可以防止覆盖正在进行的下载的实时进度
+                    if (!taskStates.containsKey(dbTask.id) || taskStates[dbTask.id]?.status?.isFinalState() == true) {
+                        updateTaskStateWithDbTask(dbTask)
+                    }
                 }
+                _uiState.value = DownloadUiState(taskStates.values.toList().sortedWith(compareBy({ it.fileName }, { it.taskId })))
+            } catch (e: Exception) {
+                Timber.e(e, "加载已保存任务失败")
             }
-            _uiState.value = DownloadUiState(taskStates.values.toList().sortedWith(compareBy({ it.fileName }, { it.taskId })))
         }
     }
 
     fun handleDownloadAction(urls: List<String>) {
+        val downloadDir = application.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: return
         viewModelScope.launch {
-            val downloadDir = application.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: return@launch
             urls.forEach { url ->
-                // 确保文件名对每个URL都是唯一的，即使它们在同一毫秒内被添加
-                val fileName = "${System.currentTimeMillis()}_${url.hashCode().toString(36)}_${UUID.randomUUID().toString().take(4)}.apk"
-                val chunkedConfig = ChunkedDownloadConfig(enabled = true)
-                DownloadManager.enqueueNewDownload(url.trim(), downloadDir.absolutePath, fileName, chunkedConfig = chunkedConfig)
+                try {
+                    // 确保文件名对每个URL都是唯一的，即使它们在同一毫秒内被添加
+                    val fileName = "${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(8)}.bin"
+                    val chunkedConfig = ChunkedDownloadConfig(enabled = true)
+                    val taskId = downloadUseCase.enqueueNewDownload(url.trim(), downloadDir.absolutePath, fileName, chunkedConfig = chunkedConfig)
+                    Timber.i("已添加下载任务: $taskId, URL: $url")
+                } catch (e: Exception) {
+                    Timber.e(e, "添加下载任务失败: $url")
+                }
             }
         }
     }
 
-    fun cancelTask(taskId: String) = viewModelScope.launch { DownloadManager.cancelDownload(taskId) }
-    fun pauseTask(taskId: String) = viewModelScope.launch { DownloadManager.pauseDownload(taskId) }
-    fun resumeTask(taskId: String) = viewModelScope.launch { DownloadManager.resumeDownload(taskId) }
-
-    private fun formatBytes(bytes: Long): String {
-        if (bytes < 0) return "0 B"
-        if (bytes < 1024) return "$bytes B"
-        val units = arrayOf("B", "KB", "MB", "GB", "TB")
-        val digitGroups = (Math.log10(bytes.toDouble()) / Math.log10(1024.0)).toInt()
-        return "%.2f %s".format(bytes / Math.pow(1024.0, digitGroups.toDouble()), units[digitGroups])
+    fun cancelTask(taskId: String) = viewModelScope.launch {
+        try {
+            downloadUseCase.cancelDownload(taskId)
+            Timber.i("已取消任务: $taskId")
+        } catch (e: Exception) {
+            Timber.e(e, "取消任务失败: $taskId")
+        }
     }
+
+    fun pauseTask(taskId: String) = viewModelScope.launch {
+        try {
+            downloadUseCase.pauseDownload(taskId)
+            Timber.i("已暂停任务: $taskId")
+        } catch (e: Exception) {
+            Timber.e(e, "暂停任务失败: $taskId")
+        }
+    }
+
+    fun resumeTask(taskId: String) = viewModelScope.launch {
+        try {
+            downloadUseCase.resumeDownload(taskId)
+            Timber.i("已恢复任务: $taskId")
+        } catch (e: Exception) {
+            Timber.e(e, "恢复任务失败: $taskId")
+        }
+    }
+
+    private fun formatBytes(bytes: Long): String = DownloadFormatter.formatBytes(bytes)
 
     private fun mapStatusToText(status: DownloadStatus): String {
         return when (status) {
@@ -123,7 +159,7 @@ class DownloadViewModel(private val application: Application) : ViewModel() {
                     .readTimeout(30, TimeUnit.SECONDS)
                     .writeTimeout(30, TimeUnit.SECONDS)
                     .build()
-                DownloadManager.testRawOkHttpSpeed(url, client)
+                downloadUseCase.testRawOkHttpSpeed(url, client)
             } catch (e: Exception) {
                 Timber.e(e, "Error testing raw OkHttp speed")
             }

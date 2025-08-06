@@ -1,4 +1,4 @@
-package cn.cqautotest.downloader.downloader
+package cn.cqautotest.downloader.entity
 
 data class DownloadTaskUiState(
     val taskId: String,

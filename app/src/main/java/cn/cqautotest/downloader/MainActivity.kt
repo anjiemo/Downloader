@@ -33,12 +33,13 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
-import cn.cqautotest.downloader.downloader.DownloadStatus
-import cn.cqautotest.downloader.downloader.DownloadTaskUiState
-import cn.cqautotest.downloader.downloader.DownloadUiState
-import cn.cqautotest.downloader.downloader.DownloadViewModel
-import cn.cqautotest.downloader.downloader.DownloadViewModelFactory
+import cn.cqautotest.downloader.di.DownloadModule
+import cn.cqautotest.downloader.entity.DownloadStatus
+import cn.cqautotest.downloader.entity.DownloadTaskUiState
+import cn.cqautotest.downloader.entity.DownloadUiState
 import cn.cqautotest.downloader.ui.theme.DownloaderTheme
+import cn.cqautotest.downloader.viewmodel.DownloadViewModel
+import cn.cqautotest.downloader.viewmodel.DownloadViewModelFactory
 
 class MainActivity : ComponentActivity() {
 
@@ -48,7 +49,10 @@ class MainActivity : ComponentActivity() {
     // private val apkUrl = "https://15a2e1bdce38c6fbde3c4eadb199d5ed.rdt.tfogc.com:49156/downv6.qq.com/qqweb/QQ_1/android_apk/Android_9.2.5_64.apk?mkey=6889ac6d71f938fd092dce5fb7ea7d28&cip=113.249.30.8&proto=https&access_type=&tx_domain=down.qq.com&tx_path=%2Fqqweb%2F&tx_id=6c9382a8c8"
     // private val apkUrl = "https://images.sunofbeaches.com/content/2022_01_03/927680635693170688.png?imageMogr2/thumbnail/600x300"
     private val downloadViewModel: DownloadViewModel by viewModels {
-        DownloadViewModelFactory(application)
+        DownloadViewModelFactory(
+            application = application,
+            downloadUseCase = DownloadModule.provideDownloadUseCase(application)
+        )
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {

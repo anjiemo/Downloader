@@ -1,13 +1,12 @@
-package cn.cqautotest.downloader.downloader
+package cn.cqautotest.downloader.db.dao
 
-import android.content.Context
 import androidx.room.Dao
-import androidx.room.Database
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
-import androidx.room.Room
-import androidx.room.RoomDatabase
+import cn.cqautotest.downloader.entity.DownloadMode
+import cn.cqautotest.downloader.entity.DownloadStatus
+import cn.cqautotest.downloader.entity.DownloadTask
 
 @Dao
 interface DownloadDao {
@@ -95,57 +94,4 @@ interface DownloadDao {
      */
     @Query("UPDATE download_tasks SET supportsRangeRequests = :supports WHERE id = :taskId")
     suspend fun updateRangeSupport(taskId: String, supports: Boolean)
-}
-
-@Dao
-interface ChunkDao {
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insertOrUpdateChunk(chunk: DownloadChunk)
-
-    @Query("SELECT * FROM download_chunks WHERE taskId = :taskId ORDER BY chunkIndex")
-    suspend fun getChunksByTaskId(taskId: String): List<DownloadChunk>
-
-    @Query("SELECT * FROM download_chunks WHERE taskId = :taskId AND status = :status")
-    suspend fun getChunksByTaskIdAndStatus(taskId: String, status: DownloadStatus): List<DownloadChunk>
-
-    @Query("UPDATE download_chunks SET downloadedBytes = :downloadedBytes, status = :status WHERE id = :chunkId")
-    suspend fun updateChunkProgress(chunkId: String, downloadedBytes: Long, status: DownloadStatus)
-
-    @Query("UPDATE download_chunks SET status = :status, errorDetails = :error WHERE id = :chunkId")
-    suspend fun updateChunkStatus(chunkId: String, status: DownloadStatus, error: String?)
-
-    @Query("UPDATE download_chunks SET retryCount = retryCount + 1, lastRetryTime = :retryTime WHERE id = :chunkId")
-    suspend fun incrementRetryCount(chunkId: String, retryTime: Long = System.currentTimeMillis())
-
-    @Query("DELETE FROM download_chunks WHERE taskId = :taskId")
-    suspend fun deleteChunksByTaskId(taskId: String)
-
-    @Query("SELECT COUNT(*) FROM download_chunks WHERE taskId = :taskId AND status = :status")
-    suspend fun getChunkCountByStatus(taskId: String, status: DownloadStatus): Int
-
-    @Query("SELECT SUM(downloadedBytes) FROM download_chunks WHERE taskId = :taskId")
-    suspend fun getTotalDownloadedBytesForTask(taskId: String): Long?
-}
-
-@Database(entities = [DownloadTask::class, DownloadChunk::class], version = 3, exportSchema = false)
-abstract class AppDatabase : RoomDatabase() {
-    abstract fun downloadDao(): DownloadDao
-    abstract fun chunkDao(): ChunkDao
-
-    companion object {
-        @Volatile
-        private var INSTANCE: AppDatabase? = null
-
-        fun getDatabase(context: Context): AppDatabase {
-            return INSTANCE ?: synchronized(this) {
-                Room.databaseBuilder(
-                    context.applicationContext,
-                    AppDatabase::class.java,
-                    "download_manager_db"
-                )
-                .build()
-                .also { INSTANCE = it }
-            }
-        }
-    }
 }
