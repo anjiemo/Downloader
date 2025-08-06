@@ -31,6 +31,9 @@ interface ChunkDao {
     @Query("UPDATE download_chunks SET retryCount = retryCount + 1, lastRetryTime = :retryTime WHERE id = :chunkId")
     suspend fun incrementRetryCount(chunkId: String, retryTime: Long = System.currentTimeMillis())
 
+    @Query("UPDATE download_chunks SET retryCount = 0, lastRetryTime = 0 WHERE id = :chunkId")
+    suspend fun resetChunkRetryCount(chunkId: String)
+
     @Query("DELETE FROM download_chunks WHERE taskId = :taskId")
     suspend fun deleteChunksByTaskId(taskId: String)
 

@@ -123,6 +123,10 @@ class DownloadManager(
 
         // 启动后台任务处理器协程，用于处理下载队列中的任务
         startTaskProcessor()
+
+        // 启动网络状态监听，当网络恢复时自动恢复因网络问题暂停的任务
+        startNetworkStateMonitoring()
+        
         // 恢复在应用上次关闭时可能被中断的下载任务
         downloadScope.launch {
             resumeInterruptedTasksOnStart()
@@ -145,13 +149,139 @@ class DownloadManager(
 
         Timber.i("正在启动任务处理器 (Task processor)...")
         taskProcessorJob = downloadScope.launch {
-            processDownloadTasks()
+            try {
+                processDownloadTasks()
+            } catch (e: Exception) {
+                Timber.e(e, "任务处理器发生异常")
+            }
+        }
+        Timber.i("任务处理器已启动，Job状态: ${taskProcessorJob?.isActive}")
+    }
+
+    /**
+     * 启动网络状态监听，当网络恢复时自动恢复因网络问题暂停的任务
+     */
+    private fun startNetworkStateMonitoring() {
+        checkInitialized()
+
+        downloadScope.launch {
+            try {
+                Timber.i("开始监听网络状态变化")
+                networkManager.isNetworkConnected.collect { isConnected ->
+                    Timber.d("网络状态变化: isConnected=$isConnected")
+                    if (isConnected) {
+                        // 网络恢复，尝试恢复因网络问题暂停的任务
+                        Timber.i("网络已恢复，尝试恢复因网络问题暂停的任务")
+                        resumeNetworkPausedTasks()
+                    } else {
+                        Timber.w("网络已断开")
+                    }
+                }
+            } catch (e: Exception) {
+                Timber.e(e, "网络状态监听发生异常")
+            }
+        }
+    }
+
+    /**
+     * 恢复因网络问题暂停的任务
+     */
+    private suspend fun resumeNetworkPausedTasks() {
+        try {
+            // 确保任务处理器正在运行
+            if (taskProcessorJob?.isActive != true) {
+                Timber.w("任务处理器不活跃，重新启动")
+                startTaskProcessor()
+                delay(200) // 给任务处理器一些启动时间
+            }
+
+            // 获取所有因网络问题暂停的任务
+            val allPausedTasks = repository.getTasksByStatuses(listOf(DownloadStatus.PAUSED))
+            Timber.d("找到 ${allPausedTasks.size} 个暂停的任务")
+
+            val networkPausedTasks = allPausedTasks.filter { it.isPausedByNetwork }
+            Timber.d("其中 ${networkPausedTasks.size} 个是因网络问题暂停的任务")
+
+            networkPausedTasks.forEach { task ->
+                Timber.d("网络暂停任务: ${task.id}, 模式: ${task.downloadMode}, 状态: ${task.status}")
+            }
+
+            if (networkPausedTasks.isNotEmpty()) {
+                Timber.i("发现 ${networkPausedTasks.size} 个因网络问题暂停的任务，开始恢复")
+
+                networkPausedTasks.forEach { task ->
+                    when (task.downloadMode) {
+                        DownloadMode.SINGLE -> {
+                            // 单文件下载，直接恢复
+                            Timber.i("恢复单文件下载任务: ${task.id}")
+                            updateTaskStatus(task.id, DownloadStatus.PENDING, isPausedByNetwork = false, error = null)
+                            // 添加短暂延迟确保数据库更新完成
+                            delay(100)
+                            // 检查任务处理器状态
+                            if (taskProcessorJob?.isActive == true) {
+                                Timber.i("任务处理器活跃，发送任务 ${task.id} 到队列")
+                                try {
+                                    taskQueueChannel.send(task.id)
+                                    Timber.d("成功发送任务 ${task.id} 到队列")
+                                } catch (e: Exception) {
+                                    Timber.e(e, "发送任务 ${task.id} 到队列时发生错误")
+                                }
+                            } else {
+                                Timber.w("任务处理器不活跃，无法发送任务 ${task.id} 到队列")
+                            }
+                        }
+
+                        DownloadMode.CHUNKED -> {
+                            // 分片下载，检查是否有网络暂停的分片
+                            val pausedChunks = repository.getChunksByTaskIdAndStatus(task.id, DownloadStatus.PAUSED)
+                            val networkPausedChunks = pausedChunks.filter { chunk ->
+                                chunk.errorDetails?.contains("网络错误", ignoreCase = true) == true ||
+                                        chunk.errorDetails?.contains("等待重试", ignoreCase = true) == true
+                            }
+
+                            if (networkPausedChunks.isNotEmpty()) {
+                                Timber.i("恢复分片下载任务: ${task.id}，有 ${networkPausedChunks.size} 个网络暂停的分片")
+                                // 重置网络暂停分片的重试计数并设置为待处理状态
+                                networkPausedChunks.forEach { chunk ->
+                                    repository.resetChunkRetryCount(chunk.id)
+                                    repository.updateChunkStatus(chunk.id, DownloadStatus.PENDING, "网络恢复，重新尝试下载")
+                                    repository.updateChunkProgress(chunk.id, 0L, DownloadStatus.PENDING)
+                                }
+                                // 恢复任务状态
+                                updateTaskStatus(task.id, DownloadStatus.PENDING, isPausedByNetwork = false, error = null)
+                                // 添加短暂延迟确保数据库更新完成
+                                delay(100)
+                                // 检查任务处理器状态
+                                if (taskProcessorJob?.isActive == true) {
+                                    Timber.i("任务处理器活跃，发送分片任务 ${task.id} 到队列")
+                                    try {
+                                        taskQueueChannel.send(task.id)
+                                        Timber.d("成功发送分片任务 ${task.id} 到队列")
+                                    } catch (e: Exception) {
+                                        Timber.e(e, "发送分片任务 ${task.id} 到队列时发生错误")
+                                    }
+                                } else {
+                                    Timber.w("任务处理器不活跃，无法发送分片任务 ${task.id} 到队列")
+                                }
+                            } else {
+                                Timber.w("分片下载任务 ${task.id} 没有网络暂停的分片，跳过恢复")
+                            }
+                        }
+                    }
+                }
+            } else {
+                Timber.d("没有发现因网络问题暂停的任务")
+            }
+        } catch (e: Exception) {
+            Timber.e(e, "恢复网络暂停任务时发生错误")
         }
     }
 
     private suspend fun processDownloadTasks() {
         Timber.i("任务处理器 (Task processor) 协程已启动。")
         for (taskId in taskQueueChannel) {
+            Timber.d("任务处理器收到任务: $taskId")
+            
             if (!currentCoroutineContext().isActive) {
                 Timber.i("任务处理器协程不再活动。退出循环。")
                 break
@@ -159,13 +289,18 @@ class DownloadManager(
 
             // 检查网络连接状态
             if (!isNetworkConnected) {
+                Timber.w("网络未连接，暂停任务: $taskId")
                 handleNetworkUnavailable(taskId)
                 continue
             }
 
             // 检查任务是否存在且状态为PENDING
-            if (!isTaskValidForProcessing(taskId)) continue
+            if (!isTaskValidForProcessing(taskId)) {
+                Timber.w("任务 $taskId 验证失败，跳过处理")
+                continue
+            }
 
+            Timber.d("任务 $taskId 验证通过，开始处理")
             // 处理信号量获取和任务执行
             processTask(taskId)
         }
@@ -188,16 +323,15 @@ class DownloadManager(
             return false
         }
 
+        Timber.d("任务处理器验证任务 $taskId: 状态=${task.status}, isPausedByNetwork=${task.isPausedByNetwork}")
+
         if (task.status != DownloadStatus.PENDING) {
             Timber.w("任务处理器：任务 $taskId 状态不是 PENDING，而是 ${task.status}。跳过。")
             return false
         }
 
-        if (task.isPausedByNetwork) {
-            Timber.w("任务处理器：任务 $taskId 被网络暂停。跳过。")
-            return false
-        }
-
+        // 移除对 isPausedByNetwork 的检查，因为恢复的任务已经设置为 false
+        // 这个检查在 processTask 中已经存在，避免重复检查
         return true
     }
 
@@ -230,13 +364,23 @@ class DownloadManager(
     }
 
     private fun launchDownloadJob(task: DownloadTask) {
+        Timber.i("启动下载任务: ${task.id}, 模式: ${task.downloadMode}")
         val job = downloadScope.launch {
             try {
                 // 根据下载模式选择执行方法
                 when (task.downloadMode) {
-                    DownloadMode.CHUNKED -> executeChunkedDownload(task)
-                    DownloadMode.SINGLE -> executeDownload(task)
+                    DownloadMode.CHUNKED -> {
+                        Timber.d("执行分片下载: ${task.id}")
+                        executeChunkedDownload(task)
+                    }
+
+                    DownloadMode.SINGLE -> {
+                        Timber.d("执行单文件下载: ${task.id}")
+                        executeDownload(task)
+                    }
                 }
+            } catch (e: Exception) {
+                Timber.e(e, "下载任务 ${task.id} 执行时发生异常")
             } finally {
                 Timber.d("任务处理器：正在为任务 ${task.id} 释放信号量 (下载结束或失败)。")
                 downloadSemaphore.release()
@@ -248,6 +392,8 @@ class DownloadManager(
         job.invokeOnCompletion { throwable ->
             if (throwable is CancellationException) {
                 Timber.i("任务 ${task.id} 的下载 Job 通过 invokeOnCompletion 被取消: ${throwable.message}")
+            } else if (throwable != null) {
+                Timber.e(throwable, "任务 ${task.id} 的下载 Job 完成时发生异常")
             }
         }
     }
@@ -324,7 +470,7 @@ class DownloadManager(
                         lastModified = null,             // 清除 LastModified
                         isPausedByNetwork = false,       // 清除网络暂停标记
                         errorDetails = null,             // 清除错误详情
-                        createdAt = System.currentTimeMillis() // 可以选择更新创建时间或将其视为“重新激活”时间
+                        createdAt = System.currentTimeMillis() // 可以选择更新创建时间或将其视为"重新激活"时间
                     )
                     repository.insertOrUpdateTask(existingTask)
                 }
@@ -452,7 +598,7 @@ class DownloadManager(
                 // 检查网络连接
                 if (!isNetworkConnected) {
                     Timber.w("无法恢复任务 $taskId，网络已断开。确保将其标记为网络暂停。")
-                    // 如果任务当前不是“因网络暂停”的 PAUSED 状态，则更新它
+                    // 如果任务当前不是"因网络暂停"的 PAUSED 状态，则更新它
                     // 这可以处理从 FAILED 状态尝试在无网络时恢复的情况，或者从非网络原因的 PAUSED 状态尝试恢复的情况
                     if (!(task.status == DownloadStatus.PAUSED && task.isPausedByNetwork)) {
                         updateTaskStatus(taskId, DownloadStatus.PAUSED, isPausedByNetwork = true, error = IOException("尝试在网络离线时恢复。原始错误: ${task.errorDetails}"))
@@ -897,6 +1043,9 @@ class DownloadManager(
 
             Timber.e(e, "分片 ${chunk.chunkIndex} 下载失败: $errorMessage")
 
+            // 判断是否为网络原因导致的失败
+            val isNetworkError = isNetworkException(e)
+
             // 重试逻辑
             if (chunk.retryCount < 3) {
                 repository.incrementRetryCount(chunk.id)
@@ -918,14 +1067,43 @@ class DownloadManager(
                 // 递归重试
                 return downloadChunk(task, newChunk)
             } else {
-                // 重试次数用完，标记为失败
-                repository.updateChunkStatus(chunk.id, DownloadStatus.FAILED, "重试失败: $errorMessage")
-                Timber.w("分片 ${chunk.chunkIndex} 重试次数已用完，标记为失败: $errorMessage")
+                // 重试次数用完，根据是否为网络错误决定分片状态
+                if (isNetworkError) {
+                    // 网络错误，标记为暂停状态，等待网络恢复
+                    repository.updateChunkStatus(chunk.id, DownloadStatus.PAUSED, "网络错误，等待重试: $errorMessage")
+                    Timber.w("分片 ${chunk.chunkIndex} 因网络错误暂停，等待网络恢复: $errorMessage")
+                } else {
+                    // 非网络错误，标记为失败
+                    repository.updateChunkStatus(chunk.id, DownloadStatus.FAILED, "重试失败: $errorMessage")
+                    Timber.w("分片 ${chunk.chunkIndex} 重试次数已用完，标记为失败: $errorMessage")
+                }
                 return false
             }
         } finally {
             randomAccessFile?.closeQuietly()
             response?.closeQuietly()
+        }
+    }
+
+    /**
+     * 判断异常是否为网络相关异常
+     */
+    private fun isNetworkException(e: Exception): Boolean {
+        return when (e) {
+            is ConnectException -> true
+            is UnknownHostException -> true
+            is SocketException -> {
+                val messageContent = e.message ?: ""
+                val matchesSoftwareCausedAbort = messageContent.contains("Software caused connection abort", ignoreCase = true)
+                val matchesConnectionReset = messageContent.contains("Connection reset", ignoreCase = true)
+                val matchesNetworkUnreachable = messageContent.contains("Network is unreachable", ignoreCase = true) ||
+                        messageContent.contains("ENETUNREACH", ignoreCase = true)
+                val matchesHostUnreachable = messageContent.contains("EHOSTUNREACH", ignoreCase = true)
+
+                matchesSoftwareCausedAbort || matchesConnectionReset || matchesNetworkUnreachable || matchesHostUnreachable
+            }
+
+            else -> false
         }
     }
 
@@ -961,8 +1139,22 @@ class DownloadManager(
 
         // 重置失败分片的状态
         failedChunks.forEach { chunk ->
-            repository.updateChunkStatus(chunk.id, DownloadStatus.PENDING, "重新尝试下载")
-            repository.updateChunkProgress(chunk.id, 0L, DownloadStatus.PENDING)
+            // 检查是否为网络暂停的分片
+            val isNetworkPaused = chunk.status == DownloadStatus.PAUSED &&
+                    (chunk.errorDetails?.contains("网络错误", ignoreCase = true) == true ||
+                            chunk.errorDetails?.contains("等待重试", ignoreCase = true) == true)
+
+            if (isNetworkPaused) {
+                // 网络暂停的分片，重置重试计数并设置为待处理状态
+                repository.resetChunkRetryCount(chunk.id)
+                repository.updateChunkStatus(chunk.id, DownloadStatus.PENDING, "网络恢复，重新尝试下载")
+                repository.updateChunkProgress(chunk.id, 0L, DownloadStatus.PENDING)
+                Timber.d("重置网络暂停分片 ${chunk.chunkIndex} 的重试计数")
+            } else {
+                // 普通失败的分片，保持原有逻辑
+                repository.updateChunkStatus(chunk.id, DownloadStatus.PENDING, "重新尝试下载")
+                repository.updateChunkProgress(chunk.id, 0L, DownloadStatus.PENDING)
+            }
         }
 
         // 重新下载失败的分片
@@ -989,12 +1181,28 @@ class DownloadManager(
                 updateTaskStatus(task.id, DownloadStatus.FAILED, error = IOException("重试后文件完整性检查失败"))
             }
         } else {
-            // 仍有分片失败，切换到单线程下载
+            // 仍有分片失败，检查是否有网络暂停的分片
             val stillFailedChunks = repository.getChunksByTaskIdAndStatus(task.id, DownloadStatus.FAILED)
-            val stillFailedDetails = stillFailedChunks.joinToString(", ") {
-                "分片${it.chunkIndex}(${it.errorDetails})"
+            val stillPausedChunks = repository.getChunksByTaskIdAndStatus(task.id, DownloadStatus.PAUSED)
+            val networkPausedChunks = stillPausedChunks.filter { chunk ->
+                chunk.errorDetails?.contains("网络错误", ignoreCase = true) == true ||
+                        chunk.errorDetails?.contains("等待重试", ignoreCase = true) == true
             }
-            fallbackToSingleDownload(task, "重试后仍有分片失败: $stillFailedDetails")
+
+            if (networkPausedChunks.isNotEmpty()) {
+                // 有网络暂停的分片，将整个任务标记为网络暂停
+                Timber.w("重试后仍有 ${networkPausedChunks.size} 个分片因网络问题暂停")
+                updateTaskStatus(
+                    task.id, DownloadStatus.PAUSED, isPausedByNetwork = true,
+                    error = IOException("重试后仍有分片因网络问题暂停: ${networkPausedChunks.size} 个分片")
+                )
+            } else {
+                // 没有网络暂停的分片，切换到单线程下载
+                val stillFailedDetails = stillFailedChunks.joinToString(", ") {
+                    "分片${it.chunkIndex}(${it.errorDetails})"
+                }
+                fallbackToSingleDownload(task, "重试后仍有分片失败: $stillFailedDetails")
+            }
         }
     }
 
@@ -1014,14 +1222,42 @@ class DownloadManager(
         Timber.w("检测到失败的分片: $failedChunkDetails")
         Timber.i("分片完成情况: $completedCount/$totalCount")
 
-        // 计算成功率
-        val successRate = completedCount.toFloat() / totalCount
+        // 检查是否有因网络错误暂停的分片
+        val pausedChunks = repository.getChunksByTaskIdAndStatus(task.id, DownloadStatus.PAUSED)
+        val networkPausedChunks = pausedChunks.filter { chunk ->
+            chunk.errorDetails?.contains("网络错误", ignoreCase = true) == true ||
+                    chunk.errorDetails?.contains("等待重试", ignoreCase = true) == true
+        }
+
+        // 如果有网络暂停的分片，检查网络状态
+        if (networkPausedChunks.isNotEmpty()) {
+            Timber.i("检测到 ${networkPausedChunks.size} 个因网络错误暂停的分片")
+
+            if (!isNetworkConnected) {
+                // 网络未连接，将整个任务标记为网络暂停
+                Timber.w("网络未连接，将分片下载任务 ${task.id} 标记为网络暂停")
+                updateTaskStatus(
+                    task.id, DownloadStatus.PAUSED, isPausedByNetwork = true,
+                    error = IOException("分片下载因网络问题暂停: ${networkPausedChunks.size} 个分片等待网络恢复")
+                )
+                return
+            } else {
+                // 网络已连接，尝试恢复网络暂停的分片
+                Timber.i("网络已恢复，尝试恢复网络暂停的分片")
+                retryFailedChunks(task, networkPausedChunks)
+                return
+            }
+        }
+
+        // 计算成功率（排除暂停的分片）
+        val actualFailedChunks = failedChunks.filter { it.status == DownloadStatus.FAILED }
+        val successRate = completedCount.toFloat() / (completedCount + actualFailedChunks.size)
 
         when {
             // 如果成功率超过80%，尝试重新下载失败的分片
             successRate >= 0.8f -> {
                 Timber.i("成功率 ${(successRate * 100).toInt()}% 较高，尝试重新下载失败的分片")
-                retryFailedChunks(task, failedChunks)
+                retryFailedChunks(task, actualFailedChunks)
             }
             // 如果成功率在50%-80%之间，考虑切换到单线程下载
             successRate >= 0.5f -> {
@@ -1940,6 +2176,30 @@ class DownloadManager(
         taskProcessorJob?.cancel()
         activeDownloads.values.forEach { it.cancel() }
         activeDownloads.clear()
+        // 不要关闭 taskQueueChannel，因为它可能会被重新使用
         Timber.i("DownloadManager 清理完成")
+    }
+
+    /**
+     * 获取当前状态信息，用于调试
+     */
+    fun getDebugInfo(): String {
+        return buildString {
+            appendLine("DownloadManager 调试信息:")
+            appendLine("- 已初始化: $isInitialized")
+            appendLine("- 任务处理器活跃: ${taskProcessorJob?.isActive}")
+            appendLine("- 网络连接: ${networkManager.isNetworkConnected.value}")
+            appendLine("- 活跃下载数: ${activeDownloads.size}")
+            appendLine("- 最大并发数: $maxConcurrentDownloads")
+            appendLine("- 信号量可用许可: ${downloadSemaphore.availablePermits}")
+        }
+    }
+
+    /**
+     * 手动触发网络恢复逻辑，用于调试
+     */
+    suspend fun manualTriggerNetworkRecovery() {
+        Timber.i("手动触发网络恢复逻辑")
+        resumeNetworkPausedTasks()
     }
 }

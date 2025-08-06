@@ -45,6 +45,7 @@ interface DownloadRepository {
     suspend fun updateChunkProgress(chunkId: String, downloadedBytes: Long, status: DownloadStatus)
     suspend fun updateChunkStatus(chunkId: String, status: DownloadStatus, error: String?)
     suspend fun incrementRetryCount(chunkId: String, retryTime: Long = System.currentTimeMillis())
+    suspend fun resetChunkRetryCount(chunkId: String)
     suspend fun deleteChunksByTaskId(taskId: String)
     suspend fun getChunkCountByStatus(taskId: String, status: DownloadStatus): Int
     suspend fun getTotalDownloadedBytesForTask(taskId: String): Long?

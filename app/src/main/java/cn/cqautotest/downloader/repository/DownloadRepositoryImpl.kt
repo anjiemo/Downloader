@@ -118,6 +118,10 @@ class DownloadRepositoryImpl(
         return chunkDao.incrementRetryCount(chunkId, retryTime)
     }
 
+    override suspend fun resetChunkRetryCount(chunkId: String) {
+        return chunkDao.resetChunkRetryCount(chunkId)
+    }
+
     override suspend fun deleteChunksByTaskId(taskId: String) {
         return chunkDao.deleteChunksByTaskId(taskId)
     }
