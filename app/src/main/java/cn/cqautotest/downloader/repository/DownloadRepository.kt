@@ -39,6 +39,7 @@ interface DownloadRepository {
 
     // region 分片管理
     suspend fun insertOrUpdateChunk(chunk: DownloadChunk)
+    suspend fun getChunkById(chunkId: String): DownloadChunk?
     suspend fun getChunksByTaskId(taskId: String): List<DownloadChunk>
     suspend fun getChunksByTaskIdAndStatus(taskId: String, status: DownloadStatus): List<DownloadChunk>
     suspend fun updateChunkProgress(chunkId: String, downloadedBytes: Long, status: DownloadStatus)

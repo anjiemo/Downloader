@@ -91,6 +91,10 @@ class DownloadRepositoryImpl(
         return chunkDao.insertOrUpdateChunk(chunk)
     }
 
+    override suspend fun getChunkById(chunkId: String): DownloadChunk? {
+        return chunkDao.getChunkById(chunkId)
+    }
+
     override suspend fun getChunksByTaskId(taskId: String): List<DownloadChunk> {
         return chunkDao.getChunksByTaskId(taskId)
     }

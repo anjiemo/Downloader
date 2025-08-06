@@ -13,6 +13,9 @@ interface ChunkDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertOrUpdateChunk(chunk: DownloadChunk)
 
+    @Query("SELECT * FROM download_chunks WHERE id = :chunkId")
+    suspend fun getChunkById(chunkId: String): DownloadChunk?
+
     @Query("SELECT * FROM download_chunks WHERE taskId = :taskId ORDER BY chunkIndex")
     suspend fun getChunksByTaskId(taskId: String): List<DownloadChunk>
 

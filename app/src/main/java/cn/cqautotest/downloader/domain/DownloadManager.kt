@@ -72,6 +72,8 @@ class DownloadManager(
     @Volatile
     private var isInitialized = false // DownloadManager 初始化标志
     private var isEnableGzip = true
+    private val isNetworkConnected
+        get() = networkManager.isNetworkConnected.value
 
     /**
      * 下载配置数据类
@@ -156,7 +158,7 @@ class DownloadManager(
             }
 
             // 检查网络连接状态
-            if (!networkManager.isNetworkConnected.value) {
+            if (!isNetworkConnected) {
                 handleNetworkUnavailable(taskId)
                 continue
             }
@@ -384,7 +386,7 @@ class DownloadManager(
 
         // 仅当任务确实处于 PENDING 状态时才将其发送到处理队列
         if (taskToProcess.status == DownloadStatus.PENDING) {
-            if (!networkManager.isNetworkConnected.value) {
+            if (!isNetworkConnected) {
                 // 如果当前没有网络连接，则不将任务放入下载队列，而是将其标记为因网络暂停
                 Timber.w("网络未连接。任务 ${taskToProcess.id} (${taskToProcess.fileName}) 将被标记为 PAUSED (因网络原因)。")
                 updateTaskStatus(taskToProcess.id, DownloadStatus.PAUSED, isPausedByNetwork = true, error = IOException("入队时网络不可用"))
@@ -448,7 +450,7 @@ class DownloadManager(
             // 仅当任务处于 PAUSED 或 FAILED 状态时才尝试恢复
             if (task.status == DownloadStatus.PAUSED || task.status == DownloadStatus.FAILED) {
                 // 检查网络连接
-                if (!networkManager.isNetworkConnected.value) {
+                if (!isNetworkConnected) {
                     Timber.w("无法恢复任务 $taskId，网络已断开。确保将其标记为网络暂停。")
                     // 如果任务当前不是“因网络暂停”的 PAUSED 状态，则更新它
                     // 这可以处理从 FAILED 状态尝试在无网络时恢复的情况，或者从非网络原因的 PAUSED 状态尝试恢复的情况
@@ -640,12 +642,12 @@ class DownloadManager(
             when (currentTaskState.status) {
                 DownloadStatus.PAUSED -> {
                     // 场景1: 如果任务是网络暂停的，并且现在网络已连接，则尝试恢复
-                    if (currentTaskState.isPausedByNetwork && networkManager.isNetworkConnected.value) {
+                    if (currentTaskState.isPausedByNetwork && isNetworkConnected) {
                         Timber.i("任务 ${currentTaskState.id} 因网络暂停，网络已恢复。尝试恢复。")
                         resumeDownload(currentTaskState.id)
                     }
                     // 场景4: 如果任务是用户手动暂停的 (PAUSED 但非 isPausedByNetwork)，并且网络连接，则保持不变
-                    else if (!currentTaskState.isPausedByNetwork && networkManager.isNetworkConnected.value) {
+                    else if (!currentTaskState.isPausedByNetwork && isNetworkConnected) {
                         Timber.d("任务 ${currentTaskState.id} 状态为 PAUSED (非网络原因) 且网络已连接。将等待手动恢复。")
                         // 此处无需操作，等待用户手动恢复
                     }
@@ -654,7 +656,7 @@ class DownloadManager(
 
                 DownloadStatus.PENDING -> {
                     // 场景2: 如果任务是 PENDING 状态，并且网络已连接，则加入下载队列
-                    if (networkManager.isNetworkConnected.value) {
+                    if (isNetworkConnected) {
                         Timber.d("任务 ${currentTaskState.id} 状态为 PENDING 且网络已连接。添加到队列。")
                         taskQueueChannel.send(currentTaskState.id)
                     }
@@ -1733,7 +1735,7 @@ class DownloadManager(
                 Timber.i("任务 ${currentTask.id}: IOException (${e.javaClass.simpleName}: '${e.message}') 被识别为可能的网络突断。设置状态为 PAUSED，标记为网络问题。")
             } else {
                 // 如果不是预定义的网络突断异常，则依赖全局 isNetworkConnected 状态
-                val currentGlobalNetworkConnectedState = networkManager.isNetworkConnected.value // 捕获当前全局状态以供日志记录
+                val currentGlobalNetworkConnectedState = isNetworkConnected // 捕获当前全局状态以供日志记录
                 Timber.d("任务 ${currentTask.id}: IOException (${e.javaClass.simpleName}: '${e.message}') 未被识别为典型的网络突断。将依赖全局 isNetworkConnected 状态 (当前值: $currentGlobalNetworkConnectedState)。")
                 if (!currentGlobalNetworkConnectedState) { // 使用捕获的全局状态
                     newStatus = DownloadStatus.PAUSED
@@ -1745,7 +1747,7 @@ class DownloadManager(
                     Timber.w("任务 ${currentTask.id}: 全局网络状态为连接。设置状态为 FAILED，标记为非网络问题。")
                 }
             }
-            Timber.d("任务 ${currentTask.id}: IOException 处理决策: newStatus=$newStatus, isConsideredNetworkIssueForThisError=$isConsideredNetworkIssueForThisError (基于 isLikelySuddenNetworkLoss=$isLikelySuddenNetworkLoss 和当时的全局 isNetworkConnected=${networkManager.isNetworkConnected.value})")
+            Timber.d("任务 ${currentTask.id}: IOException 处理决策: newStatus=$newStatus, isConsideredNetworkIssueForThisError=$isConsideredNetworkIssueForThisError (基于 isLikelySuddenNetworkLoss=$isLikelySuddenNetworkLoss 和当时的全局 isNetworkConnected=${isNetworkConnected})")
             handleCancellationOrError(currentTask.id, newStatus, e, isConsideredNetworkIssueForThisError)
         } catch (e: Exception) {
             Timber.e(e, "任务 ${currentTask.id} 下载期间发生意外错误: ${e.message}")
@@ -1754,7 +1756,7 @@ class DownloadManager(
 
             Timber.d("任务 ${currentTask.id} 异常时双指针更新为: $currentDownloadedBeforeError")
 
-            handleCancellationOrError(currentTask.id, DownloadStatus.FAILED, e, !networkManager.isNetworkConnected.value)
+            handleCancellationOrError(currentTask.id, DownloadStatus.FAILED, e, !isNetworkConnected)
         } finally {
             try {
                 // 只有在文件句柄还没有关闭的情况下才关闭
@@ -1799,7 +1801,7 @@ class DownloadManager(
 
                 val finalIsNetworkPaused = when (statusToSet) {
                     DownloadStatus.PAUSED -> isNetworkIssue // 用户取消时 isNetworkIssue=false, 网络问题时 isNetworkIssue=true
-                    DownloadStatus.FAILED -> if (error is IOException && !networkManager.isNetworkConnected.value) true else currentTaskState.isPausedByNetwork
+                    DownloadStatus.FAILED -> if (error is IOException && !isNetworkConnected) true else currentTaskState.isPausedByNetwork
                     else -> currentTaskState.isPausedByNetwork
                 }
                 updateTaskStatus(taskId, statusToSet, isPausedByNetwork = finalIsNetworkPaused, error = error)
