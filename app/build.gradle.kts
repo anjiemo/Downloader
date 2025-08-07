@@ -2,7 +2,6 @@ plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
-    alias(libs.plugins.google.ksp)
 }
 
 android {
@@ -29,16 +28,13 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions {
-        jvmTarget = "17"
-    }
     buildFeatures {
         compose = true
     }
 }
 
 dependencies {
-
+    implementation(project(":downloader"))
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.viewmodel.ktx)
@@ -55,13 +51,4 @@ dependencies {
     androidTestImplementation(libs.androidx.ui.test.junit4)
     debugImplementation(libs.androidx.ui.tooling)
     debugImplementation(libs.androidx.ui.test.manifest)
-
-    implementation(libs.androidx.room.runtime)
-    ksp(libs.androidx.room.compiler)
-    implementation(libs.androidx.room.ktx)
-    implementation(libs.androidx.room.paging)
-
-    implementation(libs.okhttp)
-    implementation(libs.utilcodex)
-    implementation(libs.timber)
 }
