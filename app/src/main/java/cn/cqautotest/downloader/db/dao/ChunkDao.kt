@@ -25,8 +25,8 @@ interface ChunkDao {
     @Query("UPDATE download_chunks SET downloadedBytes = :downloadedBytes, status = :status WHERE id = :chunkId")
     suspend fun updateChunkProgress(chunkId: String, downloadedBytes: Long, status: DownloadStatus)
 
-    @Query("UPDATE download_chunks SET status = :status, errorDetails = :error WHERE id = :chunkId")
-    suspend fun updateChunkStatus(chunkId: String, status: DownloadStatus, error: String?)
+    @Query("UPDATE download_chunks SET status = :newStatus, isPausedByNetwork = :isPausedByNetwork, errorDetails = :error WHERE id = :chunkId")
+    suspend fun updateChunkStatus(chunkId: String, newStatus: DownloadStatus, isPausedByNetwork: Boolean, error: String?)
 
     @Query("UPDATE download_chunks SET retryCount = retryCount + 1, lastRetryTime = :retryTime WHERE id = :chunkId")
     suspend fun incrementRetryCount(chunkId: String, retryTime: Long = System.currentTimeMillis())

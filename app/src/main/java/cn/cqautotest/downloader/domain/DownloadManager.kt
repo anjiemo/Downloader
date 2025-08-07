@@ -11,6 +11,7 @@ import cn.cqautotest.downloader.entity.FileIntegrityResult
 import cn.cqautotest.downloader.infrastructure.file.FileManager
 import cn.cqautotest.downloader.infrastructure.network.NetworkManager
 import cn.cqautotest.downloader.repository.DownloadRepository
+import cn.cqautotest.downloader.util.error.DownloadErrorHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
@@ -126,7 +127,7 @@ class DownloadManager(
 
         // 启动网络状态监听，当网络恢复时自动恢复因网络问题暂停的任务
         startNetworkStateMonitoring()
-        
+
         // 恢复在应用上次关闭时可能被中断的下载任务
         downloadScope.launch {
             resumeInterruptedTasksOnStart()
@@ -234,17 +235,14 @@ class DownloadManager(
                         DownloadMode.CHUNKED -> {
                             // 分片下载，检查是否有网络暂停的分片
                             val pausedChunks = repository.getChunksByTaskIdAndStatus(task.id, DownloadStatus.PAUSED)
-                            val networkPausedChunks = pausedChunks.filter { chunk ->
-                                chunk.errorDetails?.contains("网络错误", ignoreCase = true) == true ||
-                                        chunk.errorDetails?.contains("等待重试", ignoreCase = true) == true
-                            }
+                            val networkPausedChunks = pausedChunks.filter { chunk -> chunk.isPausedByNetwork }
 
                             if (networkPausedChunks.isNotEmpty()) {
                                 Timber.i("恢复分片下载任务: ${task.id}，有 ${networkPausedChunks.size} 个网络暂停的分片")
                                 // 重置网络暂停分片的重试计数并设置为待处理状态
                                 networkPausedChunks.forEach { chunk ->
                                     repository.resetChunkRetryCount(chunk.id)
-                                    repository.updateChunkStatus(chunk.id, DownloadStatus.PENDING, "网络恢复，重新尝试下载")
+                                    repository.updateChunkStatus(chunk.id, DownloadStatus.PENDING, false, "网络恢复，重新尝试下载")
                                     repository.updateChunkProgress(chunk.id, 0L, DownloadStatus.PENDING)
                                 }
                                 // 恢复任务状态
@@ -281,7 +279,7 @@ class DownloadManager(
         Timber.i("任务处理器 (Task processor) 协程已启动。")
         for (taskId in taskQueueChannel) {
             Timber.d("任务处理器收到任务: $taskId")
-            
+
             if (!currentCoroutineContext().isActive) {
                 Timber.i("任务处理器协程不再活动。退出循环。")
                 break
@@ -968,7 +966,7 @@ class DownloadManager(
 
         try {
             // 更新分片状态为下载中
-            repository.updateChunkStatus(chunk.id, DownloadStatus.DOWNLOADING, null)
+            repository.updateChunkStatus(chunk.id, DownloadStatus.DOWNLOADING, false, null)
 
             // 创建Range请求
             val requestBuilder = Request.Builder()
@@ -1023,7 +1021,7 @@ class DownloadManager(
             randomAccessFile = null
 
             // 更新分片状态为完成
-            repository.updateChunkStatus(chunk.id, DownloadStatus.COMPLETED, null)
+            repository.updateChunkStatus(chunk.id, DownloadStatus.COMPLETED, false, null)
 
             // 更新总进度
             updateChunkedProgress(task.id)
@@ -1049,7 +1047,7 @@ class DownloadManager(
             // 重试逻辑
             if (chunk.retryCount < 3) {
                 repository.incrementRetryCount(chunk.id)
-                repository.updateChunkStatus(chunk.id, DownloadStatus.PENDING, "重试中 (${chunk.retryCount + 1}/3)")
+                repository.updateChunkStatus(chunk.id, DownloadStatus.PENDING, false, "重试中 (${chunk.retryCount + 1}/3)")
 
                 val retryDelay = when (e) {
                     is ConnectException -> 3000L * (chunk.retryCount + 1) // 连接失败，更长的重试间隔
@@ -1070,11 +1068,11 @@ class DownloadManager(
                 // 重试次数用完，根据是否为网络错误决定分片状态
                 if (isNetworkError) {
                     // 网络错误，标记为暂停状态，等待网络恢复
-                    repository.updateChunkStatus(chunk.id, DownloadStatus.PAUSED, "网络错误，等待重试: $errorMessage")
+                    repository.updateChunkStatus(chunk.id, DownloadStatus.PAUSED, isPausedByNetwork = true, "网络错误，等待重试: $errorMessage")
                     Timber.w("分片 ${chunk.chunkIndex} 因网络错误暂停，等待网络恢复: $errorMessage")
                 } else {
                     // 非网络错误，标记为失败
-                    repository.updateChunkStatus(chunk.id, DownloadStatus.FAILED, "重试失败: $errorMessage")
+                    repository.updateChunkStatus(chunk.id, DownloadStatus.FAILED, isPausedByNetwork = false, "重试失败: $errorMessage")
                     Timber.w("分片 ${chunk.chunkIndex} 重试次数已用完，标记为失败: $errorMessage")
                 }
                 return false
@@ -1147,12 +1145,12 @@ class DownloadManager(
             if (isNetworkPaused) {
                 // 网络暂停的分片，重置重试计数并设置为待处理状态
                 repository.resetChunkRetryCount(chunk.id)
-                repository.updateChunkStatus(chunk.id, DownloadStatus.PENDING, "网络恢复，重新尝试下载")
+                repository.updateChunkStatus(chunk.id, DownloadStatus.PENDING, isPausedByNetwork = true, "网络恢复，重新尝试下载")
                 repository.updateChunkProgress(chunk.id, 0L, DownloadStatus.PENDING)
                 Timber.d("重置网络暂停分片 ${chunk.chunkIndex} 的重试计数")
             } else {
                 // 普通失败的分片，保持原有逻辑
-                repository.updateChunkStatus(chunk.id, DownloadStatus.PENDING, "重新尝试下载")
+                repository.updateChunkStatus(chunk.id, DownloadStatus.PENDING, false, "重新尝试下载")
                 repository.updateChunkProgress(chunk.id, 0L, DownloadStatus.PENDING)
             }
         }
@@ -1345,12 +1343,16 @@ class DownloadManager(
                 // 不更新任务状态，让它继续重试
             } else {
                 // 其他情况
-                updateTaskStatus(task.id, DownloadStatus.FAILED, error = IOException("分片下载状态异常"))
+                val isNetworkIssue = failedChunks.all { it.isPausedByNetwork }
+                val newStatus = if (isNetworkIssue) DownloadStatus.PAUSED else DownloadStatus.FAILED
+                updateTaskStatus(task.id, newStatus, isPausedByNetwork = isNetworkIssue, error = IOException("分片下载状态异常"))
             }
 
         } catch (e: Exception) {
             Timber.e(e, "分片下载过程中出现未处理的异常: ${task.id}")
-            updateTaskStatus(task.id, DownloadStatus.FAILED, error = e)
+            val isNetworkIssue = DownloadErrorHandler.isNetworkError(e)
+            val newStatus = if (isNetworkIssue) DownloadStatus.PAUSED else DownloadStatus.FAILED
+            updateTaskStatus(task.id, newStatus, isPausedByNetwork = isNetworkIssue, error = e)
         }
     }
 

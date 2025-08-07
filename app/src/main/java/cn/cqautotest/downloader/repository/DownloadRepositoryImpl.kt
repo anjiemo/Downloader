@@ -110,8 +110,8 @@ class DownloadRepositoryImpl(
         chunkDao.updateChunkProgress(chunkId, downloadedBytes, status)
     }
 
-    override suspend fun updateChunkStatus(chunkId: String, status: DownloadStatus, error: String?) {
-        return chunkDao.updateChunkStatus(chunkId, status, error)
+    override suspend fun updateChunkStatus(chunkId: String, status: DownloadStatus, isPausedByNetwork: Boolean, error: String?) {
+        return chunkDao.updateChunkStatus(chunkId, status, isPausedByNetwork, error)
     }
 
     override suspend fun incrementRetryCount(chunkId: String, retryTime: Long) {

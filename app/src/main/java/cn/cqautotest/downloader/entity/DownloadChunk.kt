@@ -17,6 +17,7 @@ data class DownloadChunk(
     val endByte: Long,                        // 结束字节位置
     var downloadedBytes: Long = 0L,           // 已下载字节数
     var status: DownloadStatus = DownloadStatus.PENDING,  // 分片状态
+    var isPausedByNetwork: Boolean = false,   // 是否因网络暂停
     var errorDetails: String? = null,         // 错误详情
     var retryCount: Int = 0,                  // 重试次数
     var lastRetryTime: Long = 0L,             // 最后重试时间
