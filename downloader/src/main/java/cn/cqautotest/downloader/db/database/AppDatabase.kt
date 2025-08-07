@@ -9,7 +9,7 @@ import cn.cqautotest.downloader.db.dao.DownloadDao
 import cn.cqautotest.downloader.entity.DownloadChunk
 import cn.cqautotest.downloader.entity.DownloadTask
 
-@Database(entities = [DownloadTask::class, DownloadChunk::class], version = 3, exportSchema = false)
+@Database(entities = [DownloadTask::class, DownloadChunk::class], version = 1, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
 
     abstract fun downloadDao(): DownloadDao
