@@ -1820,7 +1820,7 @@ class DownloadManager(
             }
 
             // 等待一小段时间确保文件系统完成写入
-            kotlinx.coroutines.delay(100)
+            delay(100)
 
             // 验证文件大小是否正确
             val actualFileSize = file.length()
