@@ -61,11 +61,38 @@
 └─────────────────────────────────────────────────────────────┘
 ```
 
+### 模块化设计
+
+项目采用模块化架构，将核心下载功能与UI分离：
+
+```
+Downloader/
+├── app/                        # 应用模块 (UI层)
+│   ├── src/main/java/cn/cqautotest/
+│   │   ├── App.kt             # 应用程序入口
+│   │   └── downloader/
+│   │       ├── MainActivity.kt # 主活动
+│   │       ├── ui/            # UI组件
+│   │       ├── viewmodel/     # ViewModel层
+│   │       └── util/          # UI工具类
+│   └── build.gradle.kts       # 应用模块配置
+├── downloader/                 # 下载器核心模块
+│   ├── src/main/java/cn/cqautotest/downloader/
+│   │   ├── db/               # 数据库层
+│   │   ├── di/               # 依赖注入
+│   │   ├── domain/           # 领域层
+│   │   ├── entity/           # 数据实体
+│   │   ├── infrastructure/   # 基础设施层
+│   │   └── repository/       # 仓储层
+│   └── build.gradle.kts      # 核心模块配置
+└── settings.gradle.kts       # 项目配置
+```
+
 ### 核心组件
 
 #### 1. DownloadManager
 
-- **位置**: `domain/DownloadManager.kt`
+- **位置**: `downloader/domain/DownloadManager.kt`
 - **职责**: 核心下载引擎，管理下载任务的生命周期
 - **特性**:
     - 支持单线程和分片下载
@@ -97,48 +124,57 @@
 ## 📁 项目结构
 
 ```
-downloader/src/main/java/cn/cqautotest/downloader/
-├── db/                          # 数据库层
-│   ├── dao/                     # 数据访问对象
-│   │   ├── ChunkDao.kt         # 分片数据访问
-│   │   └── DownloadDao.kt      # 下载任务数据访问
-│   └── database/
-│       └── AppDatabase.kt      # Room数据库配置
-├── di/                          # 依赖注入
-│   └── DownloadModule.kt       # 模块依赖配置
-├── domain/                      # 领域层
-│   ├── DownloadManager.kt      # 核心下载管理器
-│   └── usecase/                # 用例层
-│       ├── DownloadUseCase.kt  # 下载用例接口
-│       └── DownloadUseCaseImpl.kt # 下载用例实现
-├── entity/                      # 数据实体
-│   ├── ChunkedDownloadConfig.kt # 分片下载配置
-│   ├── DownloadChunk.kt        # 下载分片实体
-│   ├── DownloadMode.kt         # 下载模式枚举
-│   ├── DownloadProgress.kt     # 下载进度实体
-│   ├── DownloadStatus.kt       # 下载状态枚举
-│   ├── DownloadTask.kt         # 下载任务实体
-│   ├── DownloadUiState.kt      # UI状态实体
-│   └── FileIntegrityResult.kt  # 文件完整性结果
-├── infrastructure/              # 基础设施层
-│   ├── file/
-│   │   └── FileManager.kt      # 文件管理
-│   └── network/
-│       └── NetworkManager.kt   # 网络管理
-├── MainActivity.kt             # 主活动
-├── repository/                 # 仓储层
-│   ├── DownloadRepository.kt   # 下载仓储接口
-│   └── DownloadRepositoryImpl.kt # 下载仓储实现
-├── ui/                         # UI层
-│   └── theme/                  # 主题配置
-├── util/                       # 工具类
-│   ├── error/                  # 错误处理
-│   ├── format/                 # 格式化工具
-│   └── log/                    # 日志工具
-└── viewmodel/                  # ViewModel层
-    ├── DownloadLogger.kt       # 下载日志
-    ├── DownloadViewModel.kt    # 下载ViewModel
-    └── DownloadViewModelFactory.kt # ViewModel工厂
+Downloader/
+├── app/                          # 应用模块 (UI层)
+│   └── src/main/java/cn/cqautotest/
+│       ├── App.kt               # 应用程序入口
+│       └── downloader/
+│           ├── MainActivity.kt  # 主活动
+│           ├── ui/              # UI层
+│           │   └── theme/       # 主题配置
+│           ├── viewmodel/       # ViewModel层
+│           │   ├── DownloadLogger.kt       # 下载日志
+│           │   ├── DownloadViewModel.kt    # 下载ViewModel
+│           │   └── DownloadViewModelFactory.kt # ViewModel工厂
+│           └── util/            # UI工具类
+│               ├── error/       # 错误处理
+│               ├── format/      # 格式化工具
+│               └── log/         # 日志工具
+├── downloader/                   # 下载器核心模块
+│   └── src/main/java/cn/cqautotest/downloader/
+│       ├── db/                  # 数据库层
+│       │   ├── dao/             # 数据访问对象
+│       │   │   ├── ChunkDao.kt           # 分片数据访问
+│       │   │   └── DownloadDao.kt        # 下载任务数据访问
+│       │   └── database/
+│       │       └── AppDatabase.kt        # Room数据库配置
+│       ├── di/                  # 依赖注入
+│       │   └── DownloadModule.kt         # 模块依赖配置
+│       ├── domain/              # 领域层
+│       │   ├── DownloadManager.kt        # 核心下载管理器
+│       │   └── usecase/         # 用例层
+│       │       ├── DownloadUseCase.kt    # 下载用例接口
+│       │       └── DownloadUseCaseImpl.kt # 下载用例实现
+│       ├── entity/              # 数据实体
+│       │   ├── ChunkedDownloadConfig.kt  # 分片下载配置
+│       │   ├── DownloadChunk.kt          # 下载分片实体
+│       │   ├── DownloadMode.kt           # 下载模式枚举
+│       │   ├── DownloadProgress.kt       # 下载进度实体
+│       │   ├── DownloadStatus.kt         # 下载状态枚举
+│       │   ├── DownloadTask.kt           # 下载任务实体
+│       │   ├── DownloadUiState.kt        # UI状态实体
+│       │   └── FileIntegrityResult.kt    # 文件完整性结果
+│       ├── infrastructure/      # 基础设施层
+│       │   ├── file/
+│       │   │   └── FileManager.kt        # 文件管理
+│       │   └── network/
+│       │       └── NetworkManager.kt     # 网络管理
+│       └── repository/          # 仓储层
+│           ├── DownloadRepository.kt     # 下载仓储接口
+│           └── DownloadRepositoryImpl.kt # 下载仓储实现
+├── build.gradle.kts             # 根项目配置
+├── settings.gradle.kts          # 项目设置
+└── gradle/                      # Gradle配置
 ```
 
 ## 🚀 快速开始
@@ -329,6 +365,20 @@ println(debugInfo)
 ```bash
 ./gradlew connectedAndroidTest
 ```
+
+## 📦 模块说明
+
+### app 模块
+
+- **职责**: 提供用户界面和交互
+- **包含**: MainActivity、ViewModel、UI组件
+- **依赖**: downloader模块
+
+### downloader 模块
+
+- **职责**: 核心下载功能实现
+- **包含**: DownloadManager、数据实体、数据库、网络层
+- **特点**: 可独立使用，支持作为库集成到其他项目
 
 ## 📄 许可证
 
