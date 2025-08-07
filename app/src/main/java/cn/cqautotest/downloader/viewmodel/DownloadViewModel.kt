@@ -97,7 +97,7 @@ class DownloadViewModel(private val application: Application, private val downlo
                 try {
                     // 确保文件名对每个URL都是唯一的，即使它们在同一毫秒内被添加
                     val fileName = "${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(8)}.bin"
-                    val chunkedConfig = ChunkedDownloadConfig(enabled = true, maxConcurrentChunks = 0)
+                    val chunkedConfig = ChunkedDownloadConfig(enabled = false)
                     val taskId = downloadUseCase.enqueueNewDownload(url.trim(), downloadDir.absolutePath, fileName, chunkedConfig = chunkedConfig)
                     Timber.i("已添加下载任务: $taskId, URL: $url")
                 } catch (e: Exception) {
