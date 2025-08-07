@@ -4,9 +4,9 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import cn.cqautotest.downloader.db.entity.DownloadTask
 import cn.cqautotest.downloader.entity.DownloadMode
 import cn.cqautotest.downloader.entity.DownloadStatus
-import cn.cqautotest.downloader.entity.DownloadTask
 
 @Dao
 interface DownloadDao {

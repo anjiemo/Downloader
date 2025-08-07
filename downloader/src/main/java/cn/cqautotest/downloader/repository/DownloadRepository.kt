@@ -1,9 +1,9 @@
 package cn.cqautotest.downloader.repository
 
-import cn.cqautotest.downloader.entity.DownloadChunk
+import cn.cqautotest.downloader.db.entity.DownloadChunk
+import cn.cqautotest.downloader.db.entity.DownloadTask
 import cn.cqautotest.downloader.entity.DownloadMode
 import cn.cqautotest.downloader.entity.DownloadStatus
-import cn.cqautotest.downloader.entity.DownloadTask
 
 interface DownloadRepository {
 

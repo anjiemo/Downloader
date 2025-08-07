@@ -4,7 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
-import cn.cqautotest.downloader.entity.DownloadChunk
+import cn.cqautotest.downloader.db.entity.DownloadChunk
 import cn.cqautotest.downloader.entity.DownloadStatus
 
 @Dao

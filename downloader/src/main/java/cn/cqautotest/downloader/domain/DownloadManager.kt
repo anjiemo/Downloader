@@ -1,12 +1,12 @@
 package cn.cqautotest.downloader.domain
 
+import cn.cqautotest.downloader.db.entity.DownloadChunk
+import cn.cqautotest.downloader.db.entity.DownloadTask
 import cn.cqautotest.downloader.entity.ChunkProgress
 import cn.cqautotest.downloader.entity.ChunkedDownloadConfig
-import cn.cqautotest.downloader.entity.DownloadChunk
 import cn.cqautotest.downloader.entity.DownloadMode
 import cn.cqautotest.downloader.entity.DownloadProgress
 import cn.cqautotest.downloader.entity.DownloadStatus
-import cn.cqautotest.downloader.entity.DownloadTask
 import cn.cqautotest.downloader.entity.FileIntegrityResult
 import cn.cqautotest.downloader.infrastructure.file.FileManager
 import cn.cqautotest.downloader.infrastructure.network.NetworkManager

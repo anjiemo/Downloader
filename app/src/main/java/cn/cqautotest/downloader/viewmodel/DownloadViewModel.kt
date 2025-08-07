@@ -4,11 +4,11 @@ import android.app.Application
 import android.os.Environment
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import cn.cqautotest.downloader.db.entity.DownloadTask
 import cn.cqautotest.downloader.domain.usecase.DownloadUseCase
 import cn.cqautotest.downloader.entity.ChunkedDownloadConfig
 import cn.cqautotest.downloader.entity.DownloadProgress
 import cn.cqautotest.downloader.entity.DownloadStatus
-import cn.cqautotest.downloader.entity.DownloadTask
 import cn.cqautotest.downloader.entity.DownloadTaskUiState
 import cn.cqautotest.downloader.entity.DownloadUiState
 import cn.cqautotest.downloader.util.format.DownloadFormatter

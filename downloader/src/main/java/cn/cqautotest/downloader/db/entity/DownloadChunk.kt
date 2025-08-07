@@ -1,7 +1,8 @@
-package cn.cqautotest.downloader.entity
+package cn.cqautotest.downloader.db.entity
 
 import androidx.room.Entity
 import androidx.room.PrimaryKey
+import cn.cqautotest.downloader.entity.DownloadStatus
 import java.util.UUID
 
 /**

@@ -6,8 +6,8 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 import cn.cqautotest.downloader.db.dao.ChunkDao
 import cn.cqautotest.downloader.db.dao.DownloadDao
-import cn.cqautotest.downloader.entity.DownloadChunk
-import cn.cqautotest.downloader.entity.DownloadTask
+import cn.cqautotest.downloader.db.entity.DownloadChunk
+import cn.cqautotest.downloader.db.entity.DownloadTask
 
 @Database(entities = [DownloadTask::class, DownloadChunk::class], version = 1, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {

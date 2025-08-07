@@ -2,10 +2,10 @@ package cn.cqautotest.downloader.repository
 
 import cn.cqautotest.downloader.db.dao.ChunkDao
 import cn.cqautotest.downloader.db.dao.DownloadDao
-import cn.cqautotest.downloader.entity.DownloadChunk
+import cn.cqautotest.downloader.db.entity.DownloadChunk
+import cn.cqautotest.downloader.db.entity.DownloadTask
 import cn.cqautotest.downloader.entity.DownloadMode
 import cn.cqautotest.downloader.entity.DownloadStatus
-import cn.cqautotest.downloader.entity.DownloadTask
 
 class DownloadRepositoryImpl(
     private val downloadDao: DownloadDao,

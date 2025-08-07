@@ -1,6 +1,6 @@
 package cn.cqautotest.downloader.viewmodel
 
-import cn.cqautotest.downloader.entity.DownloadTask
+import cn.cqautotest.downloader.db.entity.DownloadTask
 import cn.cqautotest.downloader.util.format.DownloadFormatter
 import timber.log.Timber
 import java.text.SimpleDateFormat

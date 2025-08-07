@@ -1,8 +1,8 @@
 package cn.cqautotest.downloader.domain.usecase
 
+import cn.cqautotest.downloader.db.entity.DownloadTask
 import cn.cqautotest.downloader.entity.ChunkedDownloadConfig
 import cn.cqautotest.downloader.entity.DownloadProgress
-import cn.cqautotest.downloader.entity.DownloadTask
 import kotlinx.coroutines.flow.SharedFlow
 import okhttp3.OkHttpClient
 
