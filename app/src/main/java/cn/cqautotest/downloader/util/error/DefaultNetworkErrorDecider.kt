@@ -7,6 +7,7 @@ import java.io.IOException
 import java.net.ConnectException
 import java.net.NoRouteToHostException
 import java.net.PortUnreachableException
+import java.net.SocketException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import javax.net.ssl.SSLHandshakeException
@@ -37,7 +38,8 @@ object DefaultNetworkErrorDecider : NetworkErrorDecider {
             is SocketTimeoutException,
             is SSLHandshakeException,
             is PortUnreachableException,
-            is NoRouteToHostException -> return true
+            is NoRouteToHostException,
+            is SocketException -> return true
         }
 
         // 2. 兜底关键字匹配

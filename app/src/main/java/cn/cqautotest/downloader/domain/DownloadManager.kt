@@ -1086,24 +1086,7 @@ class DownloadManager(
     /**
      * 判断异常是否为网络相关异常
      */
-    private fun isNetworkException(e: Exception): Boolean {
-        return when (e) {
-            is ConnectException -> true
-            is UnknownHostException -> true
-            is SocketException -> {
-                val messageContent = e.message ?: ""
-                val matchesSoftwareCausedAbort = messageContent.contains("Software caused connection abort", ignoreCase = true)
-                val matchesConnectionReset = messageContent.contains("Connection reset", ignoreCase = true)
-                val matchesNetworkUnreachable = messageContent.contains("Network is unreachable", ignoreCase = true) ||
-                        messageContent.contains("ENETUNREACH", ignoreCase = true)
-                val matchesHostUnreachable = messageContent.contains("EHOSTUNREACH", ignoreCase = true)
-
-                matchesSoftwareCausedAbort || matchesConnectionReset || matchesNetworkUnreachable || matchesHostUnreachable
-            }
-
-            else -> false
-        }
-    }
+    private fun isNetworkException(e: Exception): Boolean = DownloadErrorHandler.isNetworkError(e)
 
     /**
      * 回退到单线程下载
@@ -1350,7 +1333,7 @@ class DownloadManager(
 
         } catch (e: Exception) {
             Timber.e(e, "分片下载过程中出现未处理的异常: ${task.id}")
-            val isNetworkIssue = DownloadErrorHandler.isNetworkError(e)
+            val isNetworkIssue = isNetworkException(e)
             val newStatus = if (isNetworkIssue) DownloadStatus.PAUSED else DownloadStatus.FAILED
             updateTaskStatus(task.id, newStatus, isPausedByNetwork = isNetworkIssue, error = e)
         }
