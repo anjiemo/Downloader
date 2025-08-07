@@ -97,7 +97,7 @@
 ## 📁 项目结构
 
 ```
-app/src/main/java/cn/cqautotest/downloader/
+downloader/src/main/java/cn/cqautotest/downloader/
 ├── db/                          # 数据库层
 │   ├── dao/                     # 数据访问对象
 │   │   ├── ChunkDao.kt         # 分片数据访问
