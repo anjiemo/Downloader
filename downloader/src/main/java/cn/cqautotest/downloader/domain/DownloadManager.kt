@@ -1121,10 +1121,7 @@ class DownloadManager(
         // 重置失败分片的状态
         failedChunks.forEach { chunk ->
             // 检查是否为网络暂停的分片
-            val isNetworkPaused = chunk.status == DownloadStatus.PAUSED &&
-                    (chunk.errorDetails?.contains("网络错误", ignoreCase = true) == true ||
-                            chunk.errorDetails?.contains("等待重试", ignoreCase = true) == true)
-
+            val isNetworkPaused = chunk.status == DownloadStatus.PAUSED && chunk.isPausedByNetwork
             if (isNetworkPaused) {
                 // 网络暂停的分片，重置重试计数并设置为待处理状态
                 repository.resetChunkRetryCount(chunk.id)
@@ -1165,10 +1162,7 @@ class DownloadManager(
             // 仍有分片失败，检查是否有网络暂停的分片
             val stillFailedChunks = repository.getChunksByTaskIdAndStatus(task.id, DownloadStatus.FAILED)
             val stillPausedChunks = repository.getChunksByTaskIdAndStatus(task.id, DownloadStatus.PAUSED)
-            val networkPausedChunks = stillPausedChunks.filter { chunk ->
-                chunk.errorDetails?.contains("网络错误", ignoreCase = true) == true ||
-                        chunk.errorDetails?.contains("等待重试", ignoreCase = true) == true
-            }
+            val networkPausedChunks = stillPausedChunks.filter { chunk -> chunk.isPausedByNetwork }
 
             if (networkPausedChunks.isNotEmpty()) {
                 // 有网络暂停的分片，将整个任务标记为网络暂停
@@ -1205,10 +1199,7 @@ class DownloadManager(
 
         // 检查是否有因网络错误暂停的分片
         val pausedChunks = repository.getChunksByTaskIdAndStatus(task.id, DownloadStatus.PAUSED)
-        val networkPausedChunks = pausedChunks.filter { chunk ->
-            chunk.errorDetails?.contains("网络错误", ignoreCase = true) == true ||
-                    chunk.errorDetails?.contains("等待重试", ignoreCase = true) == true
-        }
+        val networkPausedChunks = pausedChunks.filter { chunk -> chunk.isPausedByNetwork }
 
         // 如果有网络暂停的分片，检查网络状态
         if (networkPausedChunks.isNotEmpty()) {
